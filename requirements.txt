@@ -1,0 +1,10 @@
+-f https://download.pytorch.org/whl/torch_stable.html
+bmipy
+bokeh
+jupyter
+matplotlib
+netcdf4
+pandas
+torch>=1.8.1+cpu
+ruamel.yaml
+xarray==0.14.0
