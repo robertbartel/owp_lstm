@@ -475,7 +475,7 @@ def test_captured_bytes_unpack_to_current_state(config: Path, steps: int):
         _step(model, inputs)
 
     _create(model)
-    snapshot = codec.unpack(_state_bytes(model), expected_fingerprint=model._fingerprint)
+    snapshot = codec.unpack(_state_bytes(model))
 
     assert snapshot.timestep == steps
     assert model.get_current_time() == steps * model.get_time_step()

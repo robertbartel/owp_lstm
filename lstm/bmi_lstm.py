@@ -843,10 +843,7 @@ class bmi_LSTM(BmiBase):
             raise RuntimeError(
                 "cannot restore serialization state before initialize() is called"
             )
-        snapshot = serialization_codec.unpack(
-            payload, expected_fingerprint=self._fingerprint
-        )
-        self.apply_snapshot(snapshot)
+        self.apply_snapshot(serialization_codec.unpack(payload))
 
     def apply_snapshot(self, snapshot: serialization_codec.Snapshot) -> None:
         """
@@ -860,7 +857,12 @@ class bmi_LSTM(BmiBase):
             raise RuntimeError(
                 "cannot restore serialization state before initialize() is called"
             )
-        serialization_codec.check_fingerprint(snapshot, self._fingerprint)
+        fingerprint = bytes(snapshot.fingerprint)
+        if fingerprint != self._fingerprint:
+            raise serialization_codec.PayloadError(
+                "fingerprint mismatch: payload carries "
+                f"{fingerprint!r} but this module expects {self._fingerprint!r}"
+            )
 
         members = self.ensemble_members
         if len(snapshot.members) != len(members):

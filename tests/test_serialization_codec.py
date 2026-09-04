@@ -187,9 +187,9 @@ def test_payload_error_is_a_value_error():
 
 
 def test_unpack_rejects_payload_shorter_than_header():
-    with pytest.raises(codec.PayloadError, match="shorter than the 32-byte header"):
+    with pytest.raises(codec.PayloadError, match="truncated inside the 32-byte header"):
         codec.unpack(codec.MAGIC + b"\x01\x00\x00")
-    with pytest.raises(codec.PayloadError, match="shorter than"):
+    with pytest.raises(codec.PayloadError, match="truncated"):
         codec.unpack(b"")
 
 
@@ -301,50 +301,6 @@ def test_unpack_rejects_header_lengths_that_disagree_with_payload(
     struct.pack_into("<I", patched, last_offset, 8)
     with pytest.raises(codec.PayloadError, match="8 extra trailing bytes"):
         codec.unpack(bytes(patched))
-
-
-def test_unpack_with_matching_expected_fingerprint(multi_member_snapshot: codec.Snapshot):
-    payload = codec.pack(multi_member_snapshot)
-    restored = codec.unpack(payload, expected_fingerprint=multi_member_snapshot.fingerprint)
-    _assert_snapshots_equal(restored, multi_member_snapshot)
-    # A str form of the same UTF-8 text is accepted too.
-    restored = codec.unpack(payload, expected_fingerprint="members=3;énsemble")
-    _assert_snapshots_equal(restored, multi_member_snapshot)
-
-
-@pytest.mark.parametrize(
-    "expected",
-    [
-        b"members=3;ensemble",  # accent stripped
-        "members=3;énsemble ".encode("utf-8"),  # trailing byte
-        b"",
-        b"members=1;0:hidden=8,inputs=a|b,run=demo,epoch=3",
-    ],
-)
-def test_unpack_rejects_fingerprint_mismatch(multi_member_snapshot: codec.Snapshot, expected: bytes):
-    payload = codec.pack(multi_member_snapshot)
-    with pytest.raises(codec.PayloadError, match="fingerprint mismatch"):
-        codec.unpack(payload, expected_fingerprint=expected)
-
-
-def test_check_fingerprint_helper(multi_member_snapshot: codec.Snapshot):
-    fp = multi_member_snapshot.fingerprint
-    assert codec.check_fingerprint(multi_member_snapshot, fp) is None
-    assert codec.check_fingerprint(fp, fp) is None
-    assert codec.check_fingerprint(fp, "members=3;énsemble") is None
-    with pytest.raises(codec.PayloadError, match="fingerprint mismatch"):
-        codec.check_fingerprint(multi_member_snapshot, b"other")
-    with pytest.raises(codec.PayloadError, match=r"carries b'x' but this module expects b'y'"):
-        codec.check_fingerprint(b"x", b"y")
-
-
-def test_structural_validation_runs_before_fingerprint_check(
-    single_member_snapshot: codec.Snapshot,
-):
-    """A truncated payload is reported as truncated even when the fingerprint is also wrong."""
-    payload = codec.pack(single_member_snapshot)[:-1]
-    with pytest.raises(codec.PayloadError, match="truncated"):
-        codec.unpack(payload, expected_fingerprint=b"wrong")
 
 
 def test_unpack_returns_nothing_on_failure(single_member_snapshot: codec.Snapshot):

@@ -49,35 +49,29 @@ Any change to this layout must increment :data:`FORMAT_VERSION`.
 Validation
 ==========
 
-:func:`unpack` validates a payload before returning anything, in this order:
-minimum length for the fixed header, magic bytes, known format version,
-non-negative counts, total length exactly equal to the length implied by the
-header and the per-member hidden sizes, and (when an expected fingerprint is
-given) an exact byte comparison of the fingerprint. Every failure raises
-:class:`PayloadError`, a ``ValueError`` subclass, with a message naming the
-cause. :func:`check_fingerprint` exposes the fingerprint comparison on its own
-so a caller can verify identity before applying a decoded snapshot.
+:func:`unpack` reads the payload once, front to back, with a cursor. Every
+read is bounds-checked, so a payload that ends inside any section raises
+:class:`PayloadError` naming that section; the magic bytes and format version
+are checked as soon as the header is read; and bytes left over after the
+outputs section are reported as trailing. The :class:`Snapshot` is built only
+after the last read, so a rejected payload returns nothing. Every failure
+raises :class:`PayloadError`, a ``ValueError`` subclass, with a message naming
+the cause.
+
+The codec is a pure format: it carries the fingerprint but does not compare it
+against anything. Whether a payload fits a particular model (fingerprint,
+member count, hidden sizes, output count) is the caller's decision.
 """
 
 from __future__ import annotations
 
 import struct
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
 
-if sys.version_info < (3, 10):
-    import typing_extensions as typing
-else:
-    import typing
-
-# `slots` feature added to `dataclass` in 3.10
-if sys.version_info < (3, 10):
-    _dataclass_kwargs = {}
-else:
-    _dataclass_kwargs = {"slots": True}
+from .model_state import dataclass_kwargs, typing
 
 __all__ = [
     "MAGIC",
@@ -92,7 +86,6 @@ __all__ = [
     "PayloadError",
     "pack",
     "unpack",
-    "check_fingerprint",
 ]
 
 MAGIC: typing.Final[bytes] = b"LSTMBMI\0"
@@ -125,13 +118,12 @@ OUTPUT_DTYPE: typing.Final[np.dtype] = np.dtype("<f8")
 
 class PayloadError(ValueError):
     """
-    Raised by :func:`unpack` and :func:`check_fingerprint` when a payload is
-    malformed, has an unknown format, does not match its own header, or does
-    not carry the expected fingerprint.
+    Raised by :func:`unpack` when a payload is malformed, has an unknown
+    format, or does not match its own header.
     """
 
 
-@dataclass(**_dataclass_kwargs)
+@dataclass(**dataclass_kwargs)
 class Snapshot:
     """
     The module's computed state as plain numpy data.
@@ -149,9 +141,7 @@ class Snapshot:
     timestep: int
     fingerprint: bytes
     members: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]]
-    outputs: npt.NDArray[np.float64] = field(
-        default_factory=lambda: np.empty(0, dtype=OUTPUT_DTYPE)
-    )
+    outputs: npt.NDArray[np.float64]
 
 
 def _as_state_array(arr: npt.ArrayLike) -> npt.NDArray[np.float32]:
@@ -199,51 +189,66 @@ def pack(snapshot: Snapshot) -> bytes:
     return b"".join(chunks)
 
 
-def _coerce_fingerprint(fingerprint: typing.Union[bytes, bytearray, memoryview, str]) -> bytes:
-    """Return ``fingerprint`` as bytes; ``str`` is encoded as UTF-8."""
-    if isinstance(fingerprint, str):
-        return fingerprint.encode("utf-8")
-    return bytes(fingerprint)
-
-
-def check_fingerprint(
-    actual: typing.Union[Snapshot, bytes, bytearray, memoryview, str],
-    expected: typing.Union[bytes, bytearray, memoryview, str],
-) -> None:
+class _Cursor:
     """
-    Compare a fingerprint against the expected one byte for byte.
+    Bounds-checked forward reader over a payload buffer.
 
-    ``actual`` may be a :class:`Snapshot` (its ``fingerprint`` is used) or raw
-    fingerprint bytes/text. Raises :class:`PayloadError` on mismatch and
-    returns ``None`` otherwise.
+    Each read names the section it is reading so a short read raises a
+    :class:`PayloadError` that says where the payload ended. Offsets are
+    computed once, in the order the layout is read.
     """
-    actual_bytes = _coerce_fingerprint(actual.fingerprint if isinstance(actual, Snapshot) else actual)
-    expected_bytes = _coerce_fingerprint(expected)
-    if actual_bytes != expected_bytes:
-        raise PayloadError(
-            "fingerprint mismatch: payload carries "
-            f"{actual_bytes!r} but this module expects {expected_bytes!r}"
-        )
+
+    def __init__(self, buf: memoryview) -> None:
+        self._buf = buf
+        self._offset = 0
+
+    def read(self, size: int, what: str) -> memoryview:
+        """Return the next ``size`` bytes or raise if the payload ends inside ``what``."""
+        end = self._offset + size
+        if end > len(self._buf):
+            raise PayloadError(
+                f"payload is {len(self._buf)} bytes, truncated inside {what} "
+                f"(which ends at byte {end})"
+            )
+        chunk = self._buf[self._offset : end]
+        self._offset = end
+        return chunk
+
+    def unpack(self, layout: struct.Struct, what: str) -> tuple:
+        """Read and decode one ``struct`` record."""
+        return layout.unpack(self.read(layout.size, what))
+
+    def array(self, dtype: np.dtype, count: int, what: str) -> np.ndarray:
+        """Read ``count`` elements of ``dtype`` as an independent, writable array."""
+        return np.frombuffer(self.read(count * dtype.itemsize, what), dtype=dtype).copy()
+
+    def finish(self) -> None:
+        """Raise if any bytes remain after the last section."""
+        extra = len(self._buf) - self._offset
+        if extra:
+            raise PayloadError(
+                f"payload is {len(self._buf)} bytes but the header implies "
+                f"{self._offset} bytes ({extra} extra trailing bytes)"
+            )
 
 
-def _validated_layout(buf: memoryview) -> tuple[int, int, int, int, bytes, list[int]]:
+def unpack(
+    payload: typing.Union[bytes, bytearray, memoryview, npt.NDArray[np.uint8]],
+) -> Snapshot:
     """
-    Read and validate the header and per-member hidden sizes of ``buf``.
+    Deserialize payload bytes produced by :func:`pack` into a :class:`Snapshot`.
 
-    Returns ``(timestep, member_count, output_count, fingerprint_len,
-    fingerprint, hidden_sizes)``. Raises :class:`PayloadError` if the payload
-    is too short for the header, opens with the wrong magic, has an unknown
-    format version, carries a negative count, or has a total length that
-    differs from the one implied by the header and hidden sizes.
+    Sections are read once, in layout order, with a bounds-checked cursor (see
+    the module docstring). A :class:`PayloadError` is raised and nothing is
+    returned for a malformed, unknown-version, truncated, or over-long payload.
+
+    Returned arrays are independent copies, so mutating them does not alias
+    ``payload``.
     """
-    total = len(buf)
-    if total < HEADER_SIZE:
-        raise PayloadError(
-            f"payload is {total} bytes, shorter than the {HEADER_SIZE}-byte header"
-        )
+    cursor = _Cursor(memoryview(payload).cast("B"))
 
-    magic, version, timestep, member_count, output_count, fingerprint_len = (
-        HEADER_STRUCT.unpack_from(buf, 0)
+    magic, version, timestep, member_count, output_count, fingerprint_len = cursor.unpack(
+        HEADER_STRUCT, f"the {HEADER_SIZE}-byte header"
     )
     if magic != MAGIC:
         raise PayloadError(f"bad magic bytes: expected {MAGIC!r}, found {bytes(magic)!r}")
@@ -251,96 +256,23 @@ def _validated_layout(buf: memoryview) -> tuple[int, int, int, int, bytes, list[
         raise PayloadError(
             f"unsupported payload format version {version}; this codec reads version {FORMAT_VERSION}"
         )
-    # The header fields are unsigned on the wire, so these can only trip if the
-    # header struct is ever changed to signed fields; they keep the documented
-    # validation order explicit.
-    for name, value in (
-        ("member_count", member_count),
-        ("output_count", output_count),
-        ("fingerprint_len", fingerprint_len),
-    ):
-        if value < 0:
-            raise PayloadError(f"negative {name} in header: {value}")
 
-    offset = HEADER_SIZE + fingerprint_len
-    if total < offset:
-        raise PayloadError(
-            f"payload is {total} bytes but the header implies at least {offset} "
-            f"bytes (truncated inside the {fingerprint_len}-byte fingerprint)"
-        )
-    fingerprint = bytes(buf[HEADER_SIZE:offset])
+    fingerprint = bytes(cursor.read(fingerprint_len, f"the {fingerprint_len}-byte fingerprint"))
 
-    hidden_sizes: list[int] = []
-    for index in range(member_count):
-        if total < offset + MEMBER_HEADER_SIZE:
-            raise PayloadError(
-                f"payload is {total} bytes but the header implies at least "
-                f"{offset + MEMBER_HEADER_SIZE} bytes (truncated at member {index} of "
-                f"{member_count} header)"
-            )
-        (hidden_size,) = MEMBER_HEADER_STRUCT.unpack_from(buf, offset)
-        if hidden_size < 0:
-            raise PayloadError(f"negative hidden size for member {index}: {hidden_size}")
-        hidden_sizes.append(hidden_size)
-        offset += MEMBER_HEADER_SIZE + 2 * hidden_size * STATE_DTYPE.itemsize
-        if total < offset:
-            raise PayloadError(
-                f"payload is {total} bytes but the header implies at least {offset} "
-                f"bytes (truncated inside member {index} of {member_count}, hidden size "
-                f"{hidden_size})"
-            )
-
-    implied = offset + output_count * OUTPUT_DTYPE.itemsize
-    if total < implied:
-        raise PayloadError(
-            f"payload is {total} bytes but the header implies {implied} bytes "
-            f"(truncated inside the {output_count}-element outputs section)"
-        )
-    if total > implied:
-        raise PayloadError(
-            f"payload is {total} bytes but the header implies {implied} bytes "
-            f"({total - implied} extra trailing bytes)"
-        )
-
-    return timestep, member_count, output_count, fingerprint_len, fingerprint, hidden_sizes
-
-
-def unpack(
-    payload: typing.Union[bytes, bytearray, memoryview, npt.NDArray[np.uint8]],
-    expected_fingerprint: typing.Optional[typing.Union[bytes, bytearray, memoryview, str]] = None,
-) -> Snapshot:
-    """
-    Deserialize payload bytes produced by :func:`pack` into a :class:`Snapshot`.
-
-    The payload is fully validated (see the module docstring) before any
-    snapshot is built, so a :class:`PayloadError` is raised and nothing is
-    returned for a malformed, unknown-version, truncated, or over-long
-    payload. If ``expected_fingerprint`` is given, the payload's fingerprint
-    must match it exactly, byte for byte, or :class:`PayloadError` is raised.
-
-    Sections are read in layout order. Returned arrays are independent copies,
-    so mutating them does not alias ``payload``.
-    """
-    buf = memoryview(payload).cast("B")
-
-    timestep, _member_count, output_count, fingerprint_len, fingerprint, hidden_sizes = (
-        _validated_layout(buf)
-    )
-    if expected_fingerprint is not None:
-        check_fingerprint(fingerprint, expected_fingerprint)
-
-    offset = HEADER_SIZE + fingerprint_len
     members: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]] = []
-    for hidden_size in hidden_sizes:
-        offset += MEMBER_HEADER_SIZE
-        section = hidden_size * STATE_DTYPE.itemsize
-        hidden = np.frombuffer(buf, dtype=STATE_DTYPE, count=hidden_size, offset=offset).copy()
-        offset += section
-        cell = np.frombuffer(buf, dtype=STATE_DTYPE, count=hidden_size, offset=offset).copy()
-        offset += section
+    for index in range(member_count):
+        (hidden_size,) = cursor.unpack(
+            MEMBER_HEADER_STRUCT, f"the header of member {index} of {member_count}"
+        )
+        where = f"member {index} of {member_count}, hidden size {hidden_size}"
+        hidden = cursor.array(STATE_DTYPE, hidden_size, f"the hidden state of {where}")
+        cell = cursor.array(STATE_DTYPE, hidden_size, f"the cell state of {where}")
         members.append((hidden, cell))
 
-    outputs = np.frombuffer(buf, dtype=OUTPUT_DTYPE, count=output_count, offset=offset).copy()
+    outputs = cursor.array(
+        OUTPUT_DTYPE, output_count, f"the {output_count}-element outputs section"
+    )
+    cursor.finish()
 
     return Snapshot(
         timestep=int(timestep),
