@@ -19,6 +19,12 @@ We follow the [Semantic Versioning 2.0.0](http://semver.org/) format.
   a model fingerprint, every ensemble member's hidden and cell state, and the
   output values. Decoding validates the header, section lengths, and
   fingerprint before returning, and raises `PayloadError` otherwise.
+- `lstm.serialization_protocol`: the four reserved variables, their payload
+  buffer, and the trigger, size-announcement, and delivery dispatch live in
+  this module, independent of the LSTM; `bmi_lstm` wires it to the codec.
+  The size announcement allocates the buffer, so `ngen::serialization_size`
+  always equals the buffer length, and a delivered payload whose length
+  differs from the announcement is rejected with `ValueError`.
 - A model fingerprint computed at `initialize()` from the ensemble members
   (member count, hidden size, input names, trained-model run directory name,
   and epoch). A restore whose fingerprint does not match is rejected before
