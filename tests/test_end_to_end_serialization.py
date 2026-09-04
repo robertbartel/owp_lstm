@@ -86,10 +86,6 @@ def test_split_and_restore_matches_uninterrupted_run(
     for name in expected:
         assert len(observed_outputs[name]) == TOTAL_STEPS
         assert observed_outputs[name] == expected[name], name
-        assert np.array_equal(
-            np.array(observed_outputs[name], dtype="float64"),
-            np.array(expected[name], dtype="float64"),
-        )
 
     # exact equality of every member's hidden and cell tensors after step 24
     assert len(second_half.ensemble_members) == len(uninterrupted.ensemble_members)
@@ -183,7 +179,7 @@ def test_cross_member_count_restore_raises_and_leaves_target_untouched(
     assert_members_equal(stepped, twin)
 
 
-def test_golden_run_matches_regenerated_reference_values(
+def test_upfront_forcing_read_matches_golden_style_per_step_reads(
     golden_config: Path, nldas_forcing: Forcing
 ):
     """

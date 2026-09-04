@@ -289,11 +289,12 @@ def test_failed_capture_leaves_buffer_unchanged():
         np.array([7], dtype="int32"),
         np.array([7], dtype="uint8"),
         np.array([[7]], dtype="int64"),
+        7,
     ],
-    ids=["int64", "int32", "uint8", "2d-one-element"],
+    ids=["int64", "int32", "uint8", "2d-one-element", "python-int"],
 )
 def test_announce_allocates_a_zero_filled_buffer_of_the_announced_length(
-    protocol: SerializationProtocol, src: np.ndarray
+    protocol: SerializationProtocol, src: "np.ndarray | int"
 ):
     protocol.set_value(SERIALIZATION_SIZE, src)
     _assert_invariant(protocol, 7)

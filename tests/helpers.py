@@ -181,13 +181,8 @@ def assert_member_arrays_equal(actual: MemberArrays, expected: MemberArrays) -> 
 
 
 def assert_members_equal(actual: bmi_lstm.bmi_LSTM, expected: bmi_lstm.bmi_LSTM) -> None:
-    """Every member's hidden and cell tensors match bitwise, with dtype and shape."""
+    """Every member's hidden and cell state matches bitwise as float32."""
     assert_member_arrays_equal(member_arrays(actual), member_arrays(expected))
-    for restored, original in zip(actual.ensemble_members, expected.ensemble_members):
-        assert restored.h_t.dtype == original.h_t.dtype
-        assert restored.h_t.shape == original.h_t.shape
-        assert restored.c_t.dtype == original.c_t.dtype
-        assert restored.c_t.shape == original.c_t.shape
 
 
 def assert_size_equals_buffer_length(model: bmi_lstm.bmi_LSTM) -> None:

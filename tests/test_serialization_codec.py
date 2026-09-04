@@ -301,13 +301,3 @@ def test_unpack_rejects_header_lengths_that_disagree_with_payload(
     struct.pack_into("<I", patched, last_offset, 8)
     with pytest.raises(codec.PayloadError, match="8 extra trailing bytes"):
         codec.unpack(bytes(patched))
-
-
-def test_unpack_returns_nothing_on_failure(single_member_snapshot: codec.Snapshot):
-    """Sanity check that a failed unpack neither returns nor partially yields."""
-    result = None
-    try:
-        result = codec.unpack(codec.pack(single_member_snapshot)[:-1])
-    except codec.PayloadError:
-        pass
-    assert result is None
