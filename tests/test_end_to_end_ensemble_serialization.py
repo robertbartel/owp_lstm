@@ -146,11 +146,8 @@ def _announce_and_deliver(model: bmi_lstm.bmi_LSTM, size: int, state: bytes) -> 
 
 
 def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Flat float32 copies of every member's (hidden, cell) tensors, read directly."""
-    return [
-        (m.h_t.numpy().ravel().copy(), m.c_t.numpy().ravel().copy())
-        for m in model.ensemble_members
-    ]
+    """Flat float32 copies of every member's (hidden, cell) state via the member accessor."""
+    return [m.state_arrays() for m in model.ensemble_members]
 
 
 def _assert_members_bitwise_equal(actual: bmi_lstm.bmi_LSTM, expected: bmi_lstm.bmi_LSTM) -> None:

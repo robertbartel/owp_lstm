@@ -139,6 +139,8 @@ class EnsembleMember:
         # No need to included different batch sizes
         batch_size = 1
         hidden_layer_size = cfg["hidden_size"]
+        self.hidden_size: int = int(hidden_layer_size)
+        """element count of each of the hidden and cell state tensors"""
         # if init_config['initial_state'] == 'zero':
         # NOTE: aaraney: assume initial state is always zero (ask jframe about this. no other option now)
         self.h_t = torch.zeros(1, batch_size, hidden_layer_size).float()
@@ -171,6 +173,42 @@ class EnsembleMember:
                 self.scalars.output_std,
                 self.output_scaling_factor_cms,
             )
+
+    def state_arrays(
+        self,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        """
+        Return the hidden and cell state as a pair of flat float32 numpy copies.
+
+        The tensors are shaped (1, batch size 1, hidden size); each copy is
+        flattened to `hidden_size` elements and does not alias the tensor.
+        """
+        return (
+            np.array(self.h_t.detach().cpu().numpy(), dtype="float32").ravel(),
+            np.array(self.c_t.detach().cpu().numpy(), dtype="float32").ravel(),
+        )
+
+    def set_state_arrays(
+        self, hidden: npt.ArrayLike, cell: npt.ArrayLike
+    ) -> None:
+        """
+        Replace the hidden and cell state from a pair of flat arrays.
+
+        Each array must hold exactly `hidden_size` elements; they are converted
+        to float32 tensors of the member's state shape and assigned. A wrong
+        element count raises `ValueError` before either tensor is touched.
+        """
+        hidden_arr = np.asarray(hidden, dtype="float32").ravel()
+        cell_arr = np.asarray(cell, dtype="float32").ravel()
+        for label, arr in (("hidden", hidden_arr), ("cell", cell_arr)):
+            if arr.size != self.hidden_size:
+                raise ValueError(
+                    f"{label} state has {arr.size} elements but this member "
+                    f"has hidden size {self.hidden_size}"
+                )
+        shape = tuple(self.h_t.shape)
+        self.h_t = torch.tensor(hidden_arr, dtype=torch.float32).reshape(shape)
+        self.c_t = torch.tensor(cell_arr, dtype=torch.float32).reshape(shape)
 
 
 def bmi_array(arr: list[float]) -> npt.NDArray:
@@ -430,16 +468,6 @@ SERIALIZATION_VAR_NAMES: typing.Final[tuple[str, ...]] = (
     SERIALIZATION_STATE,
 )
 """all reserved protocol names, in protocol-document order"""
-
-
-def tensor_to_state_array(tensor: torch.Tensor) -> npt.NDArray[np.float32]:
-    """
-    Return an independent, flat float32 numpy copy of a member state tensor.
-
-    Member tensors are shaped (1, batch size 1, hidden size); the copy is
-    flattened to the hidden size, which is the layout the codec stores.
-    """
-    return np.array(tensor.detach().cpu().numpy(), dtype="float32").ravel()
 
 
 def build_serialization_state() -> State:
@@ -744,6 +772,21 @@ class bmi_LSTM(BmiBase):
 
     # ngen BMI Serialization Protocol: capture and release
 
+    def _require_initialized(self, action: str) -> None:
+        """Raise `RuntimeError` naming `action` unless `initialize()` has run."""
+        if not hasattr(self, "_fingerprint"):
+            raise RuntimeError(f"cannot {action} before initialize() is called")
+
+    @property
+    def fingerprint(self) -> bytes:
+        """
+        Identity of the initialized ensemble; see `compute_fingerprint`.
+
+        Read-only. Raises `RuntimeError` before `initialize()`.
+        """
+        self._require_initialized("read the model fingerprint")
+        return self._fingerprint
+
     def snapshot(self) -> serialization_codec.Snapshot:
         """
         Gather the module's computed state into a codec `Snapshot`.
@@ -754,14 +797,8 @@ class bmi_LSTM(BmiBase):
         Nothing on the module is modified, and the returned arrays do not alias
         the member tensors. Raises `RuntimeError` before `initialize()`.
         """
-        if not hasattr(self, "_fingerprint"):
-            raise RuntimeError(
-                "cannot capture serialization state before initialize() is called"
-            )
-        members = [
-            (tensor_to_state_array(member.h_t), tensor_to_state_array(member.c_t))
-            for member in self.ensemble_members
-        ]
+        self._require_initialized("capture serialization state")
+        members = [member.state_arrays() for member in self.ensemble_members]
         outputs = np.array(
             [self._outputs.value(name)[0] for name in self._outputs.names()],
             dtype=serialization_codec.OUTPUT_DTYPE,
@@ -839,24 +876,20 @@ class bmi_LSTM(BmiBase):
         output values are replaced. The payload's timestep is not applied and
         the capture buffer is not modified.
         """
-        if not hasattr(self, "_fingerprint"):
-            raise RuntimeError(
-                "cannot restore serialization state before initialize() is called"
-            )
+        self._require_initialized("restore serialization state")
         self.apply_snapshot(serialization_codec.unpack(payload))
 
     def apply_snapshot(self, snapshot: serialization_codec.Snapshot) -> None:
         """
         Write a codec `Snapshot` into the member tensors and output values.
 
-        All new tensors are built and every check is made before the first
-        assignment, so a rejected snapshot mutates nothing. The snapshot's
-        timestep is deliberately not applied; see the protocol notes above.
+        The checks run in order: fingerprint, member count, each member's
+        hidden and cell sizes, output count. Every check is made before the
+        first assignment, so a rejected snapshot mutates nothing. This is the
+        only place the fingerprint is compared. The snapshot's timestep is
+        deliberately not applied; see the protocol notes above.
         """
-        if not hasattr(self, "_fingerprint"):
-            raise RuntimeError(
-                "cannot restore serialization state before initialize() is called"
-            )
+        self._require_initialized("restore serialization state")
         fingerprint = bytes(snapshot.fingerprint)
         if fingerprint != self._fingerprint:
             raise serialization_codec.PayloadError(
@@ -870,35 +903,24 @@ class bmi_LSTM(BmiBase):
                 f"payload carries {len(snapshot.members)} ensemble members but this "
                 f"module has {len(members)}"
             )
+        for index, (member, (hidden, cell)) in enumerate(zip(members, snapshot.members)):
+            if hidden.size != member.hidden_size or cell.size != member.hidden_size:
+                raise serialization_codec.PayloadError(
+                    f"payload member {index} carries hidden size {hidden.size} "
+                    f"(cell {cell.size}) but this module's member has "
+                    f"{member.hidden_size}"
+                )
         output_names = list(self._outputs.names())
         if len(snapshot.outputs) != len(output_names):
             raise serialization_codec.PayloadError(
                 f"payload carries {len(snapshot.outputs)} output values but this "
                 f"module has {len(output_names)}"
             )
-
-        # build every replacement tensor up front; nothing is assigned yet.
-        tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for index, (member, (hidden, cell)) in enumerate(zip(members, snapshot.members)):
-            expected = tuple(member.h_t.shape)
-            if hidden.size != member.h_t.numel() or cell.size != member.c_t.numel():
-                raise serialization_codec.PayloadError(
-                    f"payload member {index} carries hidden size {hidden.size} "
-                    f"(cell {cell.size}) but this module's member has "
-                    f"{member.h_t.numel()}"
-                )
-            tensors.append(
-                (
-                    torch.tensor(hidden, dtype=torch.float32).reshape(expected),
-                    torch.tensor(cell, dtype=torch.float32).reshape(expected),
-                )
-            )
         outputs = np.asarray(snapshot.outputs, dtype="float64")
 
         # all checks passed: apply.
-        for member, (h_t, c_t) in zip(members, tensors):
-            member.h_t = h_t
-            member.c_t = c_t
+        for member, (hidden, cell) in zip(members, snapshot.members):
+            member.set_state_arrays(hidden, cell)
         for name, value in zip(output_names, outputs):
             self._outputs.set_value(name, value)
 

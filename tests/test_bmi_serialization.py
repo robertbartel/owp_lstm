@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from lstm import bmi_lstm
 
@@ -121,22 +122,23 @@ def test_compute_fingerprint_ignores_run_dir_parent():
 
 def test_fingerprint_set_at_initialize():
     model = bmi_lstm.bmi_LSTM()
-    assert not hasattr(model, "_fingerprint")
+    with pytest.raises(RuntimeError, match="initialize"):
+        model.fingerprint
     model.initialize(str(SINGLE_MEMBER_CONFIG))
-    assert isinstance(model._fingerprint, bytes)
-    assert model._fingerprint == (
+    assert isinstance(model.fingerprint, bytes)
+    assert model.fingerprint == (
         b"lstm-bmi;members=1;"
         b"0:hidden=126,inputs=APCP_surface|TMP_2maboveground|elev_mean|slope_mean,"
         b"run=nh_AORC_hourly_slope_elev_precip_temp_seq999_seed101_2801_191806,"
         b"epoch=9"
     )
-    assert model._fingerprint == bmi_lstm.compute_fingerprint(model.ensemble_members)
+    assert model.fingerprint == bmi_lstm.compute_fingerprint(model.ensemble_members)
 
 
 def test_fingerprint_identical_for_same_config():
     a = _initialized(SINGLE_MEMBER_CONFIG)
     b = _initialized(SINGLE_MEMBER_CONFIG)
-    assert a._fingerprint == b._fingerprint
+    assert a.fingerprint == b.fingerprint
 
 
 def test_fingerprint_differs_between_single_and_two_member_config(
@@ -145,23 +147,23 @@ def test_fingerprint_differs_between_single_and_two_member_config(
     single = _initialized(SINGLE_MEMBER_CONFIG)
     double = _initialized(two_member_config)
     assert len(double.ensemble_members) == 2
-    assert single._fingerprint != double._fingerprint
-    assert double._fingerprint.startswith(b"lstm-bmi;members=2;")
+    assert single.fingerprint != double.fingerprint
+    assert double.fingerprint.startswith(b"lstm-bmi;members=2;")
     # both members are the bundled model, so their sections differ only by index
-    sections = double._fingerprint.decode("utf-8").split(";")[2:]
+    sections = double.fingerprint.decode("utf-8").split(";")[2:]
     assert [s.split(":", 1)[0] for s in sections] == ["0", "1"]
     assert sections[0].split(":", 1)[1] == sections[1].split(":", 1)[1]
 
 
 def test_fingerprint_stable_across_updates():
     model = _initialized(SINGLE_MEMBER_CONFIG)
-    before = bytes(model._fingerprint)
+    before = bytes(model.fingerprint)
     for name in model.get_input_var_names():
         model.set_value(name, np.array([1.0], dtype="float64"))
     for _ in range(3):
         model.update()
     assert model.get_current_time() == 3 * model.get_time_step()
-    assert model._fingerprint == before
+    assert model.fingerprint == before
 
 
 # ---------------  protocol surface (reserved variables)  -----------------------------
@@ -359,11 +361,8 @@ def _state_bytes(model: bmi_lstm.bmi_LSTM) -> bytes:
 
 
 def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Flat float32 copies of every member's (hidden, cell) tensors, read directly."""
-    return [
-        (m.h_t.numpy().ravel().copy(), m.c_t.numpy().ravel().copy())
-        for m in model.ensemble_members
-    ]
+    """Flat float32 copies of every member's (hidden, cell) state via the member accessor."""
+    return [m.state_arrays() for m in model.ensemble_members]
 
 
 @pytest.fixture(params=["single", "double"])
@@ -479,7 +478,7 @@ def test_captured_bytes_unpack_to_current_state(config: Path, steps: int):
 
     assert snapshot.timestep == steps
     assert model.get_current_time() == steps * model.get_time_step()
-    assert snapshot.fingerprint == model._fingerprint
+    assert snapshot.fingerprint == model.fingerprint
 
     expected_outputs = np.array(
         [model.get_value_ptr(name)[0] for name in model.get_output_var_names()],
@@ -999,3 +998,52 @@ def test_reserved_names_stay_out_of_var_lists_after_restore(config: Path):
     for name in bmi_lstm.SERIALIZATION_VAR_NAMES:
         assert name not in target.get_input_var_names()
         assert name not in target.get_output_var_names()
+
+
+# ---------------  ensemble member state transfer  -----------------------------
+
+
+def test_member_state_arrays_are_flat_float32_copies():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    member = model.ensemble_members[0]
+    hidden, cell = member.state_arrays()
+    assert hidden.dtype == cell.dtype == np.float32
+    assert hidden.shape == cell.shape == (member.hidden_size,)
+    assert member.hidden_size == 126
+    # copies: writing to the returned arrays does not touch the member
+    hidden[0] = 123.0
+    cell[0] = 456.0
+    again_hidden, again_cell = member.state_arrays()
+    assert again_hidden[0] != 123.0
+    assert again_cell[0] != 456.0
+
+
+def test_member_set_state_arrays_keeps_tensor_shape_and_dtype():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    member = model.ensemble_members[0]
+    shape_before = tuple(member.h_t.shape)
+    hidden = np.arange(member.hidden_size, dtype="float64")
+    cell = -np.arange(member.hidden_size, dtype="float64")
+
+    member.set_state_arrays(hidden, cell)
+
+    assert tuple(member.h_t.shape) == tuple(member.c_t.shape) == shape_before
+    assert member.h_t.dtype == member.c_t.dtype == torch.float32
+    got_hidden, got_cell = member.state_arrays()
+    assert np.array_equal(got_hidden, hidden.astype("float32"))
+    assert np.array_equal(got_cell, cell.astype("float32"))
+
+
+@pytest.mark.parametrize("bad", ["hidden", "cell"])
+def test_member_set_state_arrays_rejects_wrong_size_without_mutation(bad: str):
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    member = model.ensemble_members[0]
+    before = member.state_arrays()
+    good = np.ones(member.hidden_size, dtype="float32")
+    wrong = np.ones(member.hidden_size + 1, dtype="float32")
+    hidden, cell = (wrong, good) if bad == "hidden" else (good, wrong)
+
+    with pytest.raises(ValueError, match=f"{bad} state has {member.hidden_size + 1} elements"):
+        member.set_state_arrays(hidden, cell)
+
+    _assert_members_equal([member.state_arrays()], [before])
