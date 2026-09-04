@@ -167,3 +167,191 @@ def test_pack_rejects_mismatched_hidden_and_cell_sizes():
     )
     with pytest.raises(ValueError, match="member 0"):
         codec.pack(snapshot)
+
+
+# --------------------------------------------------------------------------
+# Validation: malformed and mismatched payloads are rejected before return.
+# --------------------------------------------------------------------------
+
+
+def _patch_header(payload: bytes, **fields: int) -> bytes:
+    """Re-encode the fixed header with the given fields overridden."""
+    names = ("magic", "version", "timestep", "member_count", "output_count", "fingerprint_len")
+    values = dict(zip(names, codec.HEADER_STRUCT.unpack_from(payload, 0)))
+    values.update(fields)
+    return codec.HEADER_STRUCT.pack(*(values[n] for n in names)) + payload[codec.HEADER_SIZE :]
+
+
+def test_payload_error_is_a_value_error():
+    assert issubclass(codec.PayloadError, ValueError)
+
+
+def test_unpack_rejects_payload_shorter_than_header():
+    with pytest.raises(codec.PayloadError, match="shorter than the 32-byte header"):
+        codec.unpack(codec.MAGIC + b"\x01\x00\x00")
+    with pytest.raises(codec.PayloadError, match="shorter than"):
+        codec.unpack(b"")
+
+
+def test_unpack_rejects_wrong_magic(single_member_snapshot: codec.Snapshot):
+    payload = _patch_header(codec.pack(single_member_snapshot), magic=b"NOTLSTM\0")
+    with pytest.raises(codec.PayloadError, match="bad magic bytes"):
+        codec.unpack(payload)
+
+
+@pytest.mark.parametrize("version", [0, 2, 0xFFFFFFFF])
+def test_unpack_rejects_unknown_version(single_member_snapshot: codec.Snapshot, version: int):
+    payload = _patch_header(codec.pack(single_member_snapshot), version=version)
+    with pytest.raises(codec.PayloadError, match=f"unsupported payload format version {version}"):
+        codec.unpack(payload)
+
+
+def test_unpack_checks_magic_before_version(single_member_snapshot: codec.Snapshot):
+    payload = _patch_header(codec.pack(single_member_snapshot), magic=b"NOTLSTM\0", version=99)
+    with pytest.raises(codec.PayloadError, match="bad magic"):
+        codec.unpack(payload)
+
+
+def _cut_points(snapshot: codec.Snapshot) -> list[tuple[str, int]]:
+    """Byte offsets at which to truncate a packed snapshot, one per section."""
+    fp = len(snapshot.fingerprint)
+    h0 = snapshot.members[0][0].size
+    member0_start = codec.HEADER_SIZE + fp
+    outputs_start = member0_start + sum(
+        codec.MEMBER_HEADER_SIZE + 8 * h.size for h, _ in snapshot.members
+    )
+    return [
+        ("inside header", codec.HEADER_SIZE - 1),
+        ("inside fingerprint", codec.HEADER_SIZE + fp // 2),
+        ("inside member 0 header", member0_start + codec.MEMBER_HEADER_SIZE - 1),
+        ("inside member 0 hidden", member0_start + codec.MEMBER_HEADER_SIZE + 2 * h0),
+        ("inside member 0 cell", member0_start + codec.MEMBER_HEADER_SIZE + 4 * h0 + 2),
+        ("inside outputs", outputs_start + 3),
+        ("last byte", -1),
+    ]
+
+
+@pytest.mark.parametrize("fixture_name", ["single_member_snapshot", "multi_member_snapshot"])
+def test_unpack_rejects_truncated_payload_at_every_section(
+    fixture_name: str, request: pytest.FixtureRequest
+):
+    snapshot = request.getfixturevalue(fixture_name)
+    payload = codec.pack(snapshot)
+    for label, cut in _cut_points(snapshot):
+        truncated = payload[:cut]
+        assert len(truncated) < len(payload), label
+        with pytest.raises(codec.PayloadError, match="truncated|shorter than"):
+            codec.unpack(truncated)
+
+
+def test_unpack_rejects_extra_trailing_bytes(multi_member_snapshot: codec.Snapshot):
+    payload = codec.pack(multi_member_snapshot)
+    with pytest.raises(codec.PayloadError, match="1 extra trailing bytes"):
+        codec.unpack(payload + b"\x00")
+    with pytest.raises(codec.PayloadError, match="16 extra trailing bytes"):
+        codec.unpack(payload + bytes(16))
+
+
+def test_unpack_rejects_header_lengths_that_disagree_with_payload(
+    multi_member_snapshot: codec.Snapshot,
+):
+    payload = codec.pack(multi_member_snapshot)
+    fp_len = len(multi_member_snapshot.fingerprint)
+
+    # Fingerprint claims more bytes than the rest of the payload provides.
+    with pytest.raises(codec.PayloadError, match="truncated"):
+        codec.unpack(_patch_header(payload, fingerprint_len=len(payload)))
+    # Fingerprint claims fewer bytes, which leaves a tail that cannot be parsed
+    # to exactly the payload length (member header reinterpreted from fingerprint text).
+    with pytest.raises(codec.PayloadError):
+        codec.unpack(_patch_header(payload, fingerprint_len=fp_len - 1))
+    # More members than are present.
+    with pytest.raises(codec.PayloadError, match="truncated"):
+        codec.unpack(_patch_header(payload, member_count=4))
+    # Fewer members than are present: the leftover bytes are trailing garbage.
+    with pytest.raises(codec.PayloadError, match="extra trailing bytes"):
+        codec.unpack(_patch_header(payload, member_count=2))
+    # Output count too large and too small.
+    with pytest.raises(codec.PayloadError, match="truncated inside the 4-element outputs"):
+        codec.unpack(_patch_header(payload, output_count=4))
+    with pytest.raises(codec.PayloadError, match="8 extra trailing bytes"):
+        codec.unpack(_patch_header(payload, output_count=2))
+
+    # A member header whose hidden size disagrees with the bytes that follow.
+    # Growing or shrinking member 0 shifts where member 1's header is read, so
+    # the walk ends at a length that is not the payload length either way.
+    member0_offset = codec.HEADER_SIZE + fp_len
+    for patched_size in (5, 3):
+        patched = bytearray(payload)
+        struct.pack_into("<I", patched, member0_offset, patched_size)
+        with pytest.raises(codec.PayloadError, match="truncated|extra trailing bytes"):
+            codec.unpack(bytes(patched))
+
+    # Last member's hidden size disagrees: there is no later header to absorb the
+    # shift. A claim far larger than the remaining bytes is reported inside that
+    # member with its claimed size; a slightly smaller claim leaves trailing bytes.
+    last_offset = codec.HEADER_SIZE + fp_len + sum(
+        codec.MEMBER_HEADER_SIZE + 8 * h.size for h, _ in multi_member_snapshot.members[:-1]
+    )
+    patched = bytearray(payload)
+    struct.pack_into("<I", patched, last_offset, 100)
+    with pytest.raises(codec.PayloadError, match="member 2 of 3, hidden size 100"):
+        codec.unpack(bytes(patched))
+    patched = bytearray(payload)
+    struct.pack_into("<I", patched, last_offset, 8)
+    with pytest.raises(codec.PayloadError, match="8 extra trailing bytes"):
+        codec.unpack(bytes(patched))
+
+
+def test_unpack_with_matching_expected_fingerprint(multi_member_snapshot: codec.Snapshot):
+    payload = codec.pack(multi_member_snapshot)
+    restored = codec.unpack(payload, expected_fingerprint=multi_member_snapshot.fingerprint)
+    _assert_snapshots_equal(restored, multi_member_snapshot)
+    # A str form of the same UTF-8 text is accepted too.
+    restored = codec.unpack(payload, expected_fingerprint="members=3;énsemble")
+    _assert_snapshots_equal(restored, multi_member_snapshot)
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        b"members=3;ensemble",  # accent stripped
+        "members=3;énsemble ".encode("utf-8"),  # trailing byte
+        b"",
+        b"members=1;0:hidden=8,inputs=a|b,run=demo,epoch=3",
+    ],
+)
+def test_unpack_rejects_fingerprint_mismatch(multi_member_snapshot: codec.Snapshot, expected: bytes):
+    payload = codec.pack(multi_member_snapshot)
+    with pytest.raises(codec.PayloadError, match="fingerprint mismatch"):
+        codec.unpack(payload, expected_fingerprint=expected)
+
+
+def test_check_fingerprint_helper(multi_member_snapshot: codec.Snapshot):
+    fp = multi_member_snapshot.fingerprint
+    assert codec.check_fingerprint(multi_member_snapshot, fp) is None
+    assert codec.check_fingerprint(fp, fp) is None
+    assert codec.check_fingerprint(fp, "members=3;énsemble") is None
+    with pytest.raises(codec.PayloadError, match="fingerprint mismatch"):
+        codec.check_fingerprint(multi_member_snapshot, b"other")
+    with pytest.raises(codec.PayloadError, match=r"carries b'x' but this module expects b'y'"):
+        codec.check_fingerprint(b"x", b"y")
+
+
+def test_structural_validation_runs_before_fingerprint_check(
+    single_member_snapshot: codec.Snapshot,
+):
+    """A truncated payload is reported as truncated even when the fingerprint is also wrong."""
+    payload = codec.pack(single_member_snapshot)[:-1]
+    with pytest.raises(codec.PayloadError, match="truncated"):
+        codec.unpack(payload, expected_fingerprint=b"wrong")
+
+
+def test_unpack_returns_nothing_on_failure(single_member_snapshot: codec.Snapshot):
+    """Sanity check that a failed unpack neither returns nor partially yields."""
+    result = None
+    try:
+        result = codec.unpack(codec.pack(single_member_snapshot)[:-1])
+    except codec.PayloadError:
+        pass
+    assert result is None
