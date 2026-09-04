@@ -399,6 +399,16 @@ def compute_fingerprint(members: typing.Sequence[EnsembleMember]) -> bytes:
 # guarantees create and free are paired, but free is safe at any time, and
 # `finalize()` releases the buffer as well. Neither trigger alters the
 # computed state, so a capture mid-run cannot perturb later timesteps.
+#
+# Restore is driven through `set_value` as an ordered pair of calls: the size
+# variable announces the incoming byte count (which `get_var_nbytes` on the
+# state variable then reports, because ngen's Python adapter sizes the array
+# it delivers from it), and the state variable delivers the payload. Delivery
+# is atomic: the payload is fully decoded and checked against the module's
+# fingerprint and member layout before any member tensor or output value is
+# written, so a rejected payload leaves the module exactly as `initialize()`
+# left it. The payload's timestep is carried but not applied, and the
+# capture buffer is not touched by a restore.
 
 SERIALIZATION_CREATE: typing.Final[str] = "ngen::serialization_create"
 """trigger: capture a snapshot of the computed state into the payload buffer"""
@@ -641,6 +651,12 @@ class bmi_LSTM(BmiBase):
         return self.get_value_ptr(name).itemsize
 
     def get_var_nbytes(self, name: str) -> int:
+        if name == SERIALIZATION_STATE:
+            # the byte count recorded by the last create or announced by the
+            # last `set_value` on the size variable. ngen's Python adapter
+            # sizes the array it delivers on restore from this value, so it
+            # must reflect the announcement even while the buffer is empty.
+            return int(self._serialization.value(SERIALIZATION_SIZE)[0])
         return self.get_var_itemsize(name) * len(self.get_value_ptr(name))
 
     def get_var_location(self, name: str) -> str:
@@ -688,6 +704,13 @@ class bmi_LSTM(BmiBase):
             return None
         if name == SERIALIZATION_FREE:
             self._serialization_free()
+            return None
+        # the restore path: announce the incoming byte count, then deliver.
+        if name == SERIALIZATION_SIZE:
+            self._serialization_announce(src)
+            return None
+        if name == SERIALIZATION_STATE:
+            self.restore_state(src)
             return None
         return first_containing(name, self._outputs, self._dynamic_inputs).set_value(
             name, src
@@ -779,6 +802,103 @@ class bmi_LSTM(BmiBase):
         """Handle the free trigger: release the payload buffer. Safe at any time."""
         self._serialization_var(SERIALIZATION_STATE).value = np.empty(0, dtype="uint8")
         self._serialization.set_value(SERIALIZATION_SIZE, 0)
+
+    # ngen BMI Serialization Protocol: restore
+
+    def _serialization_announce(self, src: npt.ArrayLike) -> None:
+        """
+        Handle `set_value` on the size variable: record the announced byte
+        count of the payload about to be delivered.
+
+        `src` must hold exactly one non-negative integer. Only the size array
+        is written; the capture buffer is left as is.
+        """
+        announced = np.asarray(src).ravel()
+        if announced.size != 1:
+            raise ValueError(
+                f"{SERIALIZATION_SIZE} expects exactly one value, got {announced.size}"
+            )
+        count = int(announced[0])
+        if count < 0:
+            raise ValueError(f"{SERIALIZATION_SIZE} must be non-negative, got {count}")
+        self._serialization.set_value(SERIALIZATION_SIZE, count)
+
+    def restore_state(
+        self, payload: typing.Union[bytes, bytearray, memoryview, npt.NDArray[np.uint8]]
+    ) -> None:
+        """
+        Handle `set_value` on the state variable: decode `payload` and apply
+        it to the module's computed state.
+
+        The payload is fully validated by the codec, its fingerprint compared
+        against this module's, and its member layout and output count checked
+        against the initialized ensemble before anything is written; a
+        `serialization_codec.PayloadError` (or `RuntimeError` before
+        `initialize()`) therefore leaves every member tensor and output value
+        untouched. On success each member's hidden and cell tensors and the
+        output values are replaced. The payload's timestep is not applied and
+        the capture buffer is not modified.
+        """
+        if not hasattr(self, "_fingerprint"):
+            raise RuntimeError(
+                "cannot restore serialization state before initialize() is called"
+            )
+        snapshot = serialization_codec.unpack(
+            payload, expected_fingerprint=self._fingerprint
+        )
+        self.apply_snapshot(snapshot)
+
+    def apply_snapshot(self, snapshot: serialization_codec.Snapshot) -> None:
+        """
+        Write a codec `Snapshot` into the member tensors and output values.
+
+        All new tensors are built and every check is made before the first
+        assignment, so a rejected snapshot mutates nothing. The snapshot's
+        timestep is deliberately not applied; see the protocol notes above.
+        """
+        if not hasattr(self, "_fingerprint"):
+            raise RuntimeError(
+                "cannot restore serialization state before initialize() is called"
+            )
+        serialization_codec.check_fingerprint(snapshot, self._fingerprint)
+
+        members = self.ensemble_members
+        if len(snapshot.members) != len(members):
+            raise serialization_codec.PayloadError(
+                f"payload carries {len(snapshot.members)} ensemble members but this "
+                f"module has {len(members)}"
+            )
+        output_names = list(self._outputs.names())
+        if len(snapshot.outputs) != len(output_names):
+            raise serialization_codec.PayloadError(
+                f"payload carries {len(snapshot.outputs)} output values but this "
+                f"module has {len(output_names)}"
+            )
+
+        # build every replacement tensor up front; nothing is assigned yet.
+        tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for index, (member, (hidden, cell)) in enumerate(zip(members, snapshot.members)):
+            expected = tuple(member.h_t.shape)
+            if hidden.size != member.h_t.numel() or cell.size != member.c_t.numel():
+                raise serialization_codec.PayloadError(
+                    f"payload member {index} carries hidden size {hidden.size} "
+                    f"(cell {cell.size}) but this module's member has "
+                    f"{member.h_t.numel()}"
+                )
+            tensors.append(
+                (
+                    torch.tensor(hidden, dtype=torch.float32).reshape(expected),
+                    torch.tensor(cell, dtype=torch.float32).reshape(expected),
+                )
+            )
+        outputs = np.asarray(snapshot.outputs, dtype="float64")
+
+        # all checks passed: apply.
+        for member, (h_t, c_t) in zip(members, tensors):
+            member.h_t = h_t
+            member.c_t = c_t
+        for name, value in zip(output_names, outputs):
+            self._outputs.set_value(name, value)
 
 
 def coerce_config(cfg: dict[str, typing.Any]):

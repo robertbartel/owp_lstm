@@ -609,3 +609,393 @@ def test_size_and_state_stay_within_serialization_state_only():
         assert name not in model.get_output_var_names()
     assert model.get_input_item_count() == len(bmi_lstm._dynamic_input_vars)
     assert model.get_output_item_count() == len(bmi_lstm._output_vars)
+
+
+# ---------------  restore (size announcement and state delivery)  -----------------------------
+
+
+def _announce(model: bmi_lstm.bmi_LSTM, count: int) -> None:
+    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([count], dtype="int64"))
+
+
+def _deliver(model: bmi_lstm.bmi_LSTM, payload: bytes) -> None:
+    """Deliver the payload the way ngen's Python adapter does: as a uint8 array."""
+    model.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(payload, dtype="uint8"))
+
+
+def _restore(model: bmi_lstm.bmi_LSTM, payload: bytes) -> None:
+    """The protocol's ordered restore sequence: announce the size, then deliver."""
+    _announce(model, len(payload))
+    _deliver(model, payload)
+
+
+def _outputs(model: bmi_lstm.bmi_LSTM) -> dict[str, float]:
+    return {name: float(model.get_value_ptr(name)[0]) for name in model.get_output_var_names()}
+
+
+def _observed(model: bmi_lstm.bmi_LSTM) -> dict:
+    """Everything a restore may or may not touch, copied for later comparison."""
+    return {
+        "members": _member_arrays(model),
+        "outputs": _outputs(model),
+        "timestep": model._timestep,
+        "time": model.get_current_time(),
+        "buffer": _state_bytes(model),
+        "buffer_id": id(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)),
+    }
+
+
+def _assert_members_equal(
+    actual: list[tuple[np.ndarray, np.ndarray]],
+    expected: list[tuple[np.ndarray, np.ndarray]],
+) -> None:
+    assert len(actual) == len(expected)
+    for (h_a, c_a), (h_e, c_e) in zip(actual, expected):
+        assert h_a.dtype == h_e.dtype == np.float32
+        assert np.array_equal(h_a, h_e)
+        assert np.array_equal(c_a, c_e)
+
+
+def _assert_untouched(model: bmi_lstm.bmi_LSTM, before: dict) -> None:
+    after = _observed(model)
+    _assert_members_equal(after["members"], before["members"])
+    assert after["outputs"] == before["outputs"]
+    assert after["timestep"] == before["timestep"]
+    assert after["time"] == before["time"]
+    assert after["buffer"] == before["buffer"]
+    assert after["buffer_id"] == before["buffer_id"]
+
+
+def _captured_after(config: Path, steps: int, seed: int = 0) -> tuple[bmi_lstm.bmi_LSTM, bytes]:
+    """Run a module for `steps` and return it with the payload captured at that point."""
+    source = _initialized(config)
+    for inputs in _forcing(steps, seed=seed):
+        _step(source, inputs)
+    _create(source)
+    payload = _state_bytes(source)
+    _free(source)
+    return source, payload
+
+
+def test_announce_then_deliver_restores_members_and_outputs(config: Path):
+    source, payload = _captured_after(config, steps=4)
+    target = _initialized(config)
+    assert _outputs(target) != _outputs(source)
+
+    _announce(target, len(payload))
+    # between the two calls ngen sizes the incoming array from nbytes / itemsize
+    assert target.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == len(payload)
+    assert target.get_var_itemsize(bmi_lstm.SERIALIZATION_STATE) == 1
+    assert _size(target) == len(payload)
+    # the capture buffer itself is not pre-filled by the announcement
+    assert len(target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+
+    _deliver(target, payload)
+
+    _assert_members_equal(_member_arrays(target), _member_arrays(source))
+    assert _outputs(target) == _outputs(source)
+    for restored, original in zip(target.ensemble_members, source.ensemble_members):
+        assert restored.h_t.dtype == original.h_t.dtype
+        assert restored.h_t.shape == original.h_t.shape
+        assert restored.c_t.dtype == original.c_t.dtype
+        assert restored.c_t.shape == original.c_t.shape
+
+
+def test_restore_does_not_apply_timestep_or_clock(config: Path):
+    source, payload = _captured_after(config, steps=5)
+    assert source.get_current_time() == 5 * bmi_lstm.bmi_LSTM._timestep_size_s
+    assert codec.unpack(payload).timestep == 5
+
+    target = _initialized(config)
+    _restore(target, payload)
+    assert target._timestep == 0
+    assert target.get_current_time() == 0.0
+
+    _step(target, _forcing(1)[0])
+    assert target.get_current_time() == bmi_lstm.bmi_LSTM._timestep_size_s
+
+
+@pytest.mark.parametrize("count", [0, 1, 12345, 2**40])
+def test_nbytes_on_state_reports_announced_size(module: bmi_lstm.bmi_LSTM, count: int):
+    """Holds before and after initialize(): the announcement is pure bookkeeping."""
+    _announce(module, count)
+    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == count
+    assert _size(module) == count
+    assert module.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE).dtype == np.int64
+    assert len(module.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    # the other reserved names keep their fixed sizes
+    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_SIZE) == 8
+    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_CREATE) == 4
+    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_FREE) == 4
+
+
+def test_announce_accepts_python_int_and_other_integer_arrays():
+    model = bmi_lstm.bmi_LSTM()
+    model.set_value(bmi_lstm.SERIALIZATION_SIZE, 7)  # type: ignore[arg-type]
+    assert _size(model) == 7
+    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([9], dtype="int32"))
+    assert _size(model) == 9
+    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([[11]], dtype="int64"))
+    assert _size(model) == 11
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [np.array([-1], dtype="int64"), np.array([], dtype="int64"), np.array([1, 2], dtype="int64")],
+    ids=["negative", "empty", "two-values"],
+)
+def test_announce_rejects_invalid_counts(bad: np.ndarray):
+    model = bmi_lstm.bmi_LSTM()
+    _announce(model, 5)
+    with pytest.raises(ValueError):
+        model.set_value(bmi_lstm.SERIALIZATION_SIZE, bad)
+    assert _size(model) == 5
+
+
+def test_nbytes_after_create_equals_buffer_length_and_free_resets(config: Path):
+    """The announced count and the capture bookkeeping share the size variable."""
+    model = _initialized(config)
+    _announce(model, 99)
+    _create(model)
+    n = len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE))
+    assert n != 99
+    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == n == _size(model)
+    _free(model)
+    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+
+
+def test_restore_into_differently_configured_module_raises_and_leaves_state(
+    two_member_config: Path,
+):
+    for src_cfg, dst_cfg in [
+        (SINGLE_MEMBER_CONFIG, two_member_config),
+        (two_member_config, SINGLE_MEMBER_CONFIG),
+    ]:
+        _, payload = _captured_after(src_cfg, steps=3)
+        target = _initialized(dst_cfg)
+        before = _observed(target)
+        # initialized values: zero states and zero outputs
+        assert all(not h.any() and not c.any() for h, c in before["members"])
+        assert all(v == 0.0 for v in before["outputs"].values())
+
+        _announce(target, len(payload))
+        with pytest.raises(codec.PayloadError, match="fingerprint"):
+            _deliver(target, payload)
+
+        _assert_untouched(target, before)
+        assert target.get_current_time() == 0.0
+
+
+def test_restore_into_module_with_computed_state_leaves_it_on_failure(
+    two_member_config: Path,
+):
+    """A module that has already stepped keeps its non-trivial state on rejection."""
+    _, payload = _captured_after(SINGLE_MEMBER_CONFIG, steps=3)
+    target = _initialized(two_member_config)
+    for inputs in _forcing(2, seed=7):
+        _step(target, inputs)
+    before = _observed(target)
+    assert any(h.any() for h, _ in before["members"])
+
+    with pytest.raises(codec.PayloadError, match="fingerprint"):
+        _restore(target, payload)
+    _assert_untouched(target, before)
+
+
+@pytest.mark.parametrize("cut", [codec.HEADER_SIZE - 1, codec.HEADER_SIZE + 3, -1])
+def test_truncated_payload_raises_and_leaves_state(config: Path, cut: int):
+    _, payload = _captured_after(config, steps=2)
+    truncated = payload[:cut]
+    assert len(truncated) < len(payload)
+
+    target = _initialized(config)
+    for inputs in _forcing(2, seed=3):
+        _step(target, inputs)
+    before = _observed(target)
+
+    with pytest.raises(codec.PayloadError) as info:
+        _restore(target, truncated)
+    assert "truncated" in str(info.value) or "short" in str(info.value)
+    _assert_untouched(target, before)
+
+
+def test_over_long_and_garbage_payloads_raise_and_leave_state(config: Path):
+    _, payload = _captured_after(config, steps=2)
+    target = _initialized(config)
+    before = _observed(target)
+
+    with pytest.raises(codec.PayloadError, match="trailing"):
+        _restore(target, payload + b"\x00")
+    _assert_untouched(target, before)
+
+    garbage = b"NOTLSTM!" + payload[8:]
+    with pytest.raises(codec.PayloadError, match="magic"):
+        _restore(target, garbage)
+    _assert_untouched(target, before)
+
+    with pytest.raises(codec.PayloadError):
+        _restore(target, b"")
+    _assert_untouched(target, before)
+
+
+def test_restore_before_initialize_raises():
+    _, payload = _captured_after(SINGLE_MEMBER_CONFIG, steps=1)
+    model = bmi_lstm.bmi_LSTM()
+    _announce(model, len(payload))
+    with pytest.raises(RuntimeError, match="initialize"):
+        _deliver(model, payload)
+    # the announcement is still recorded and free is still safe afterwards
+    assert _size(model) == len(payload)
+    _free(model)
+    assert _size(model) == 0
+
+
+def test_restore_does_not_touch_capture_buffer(config: Path):
+    _, payload = _captured_after(config, steps=5)
+    target = _initialized(config)
+    for inputs in _forcing(2, seed=11):
+        _step(target, inputs)
+    _create(target)
+    buffer = target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    captured = buffer.tobytes()
+    assert captured != payload
+
+    # delivery without a prior announcement (a standalone caller) leaves both
+    # the buffer and its recorded size alone
+    _deliver(target, payload)
+    assert target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is buffer
+    assert buffer.tobytes() == captured
+    assert _size(target) == len(captured)
+
+    # with the announcement the size reflects the announcement, but the
+    # buffer is still not touched
+    _restore(target, payload)
+    assert target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is buffer
+    assert buffer.tobytes() == captured
+    assert _size(target) == len(payload)
+    assert codec.unpack(buffer).timestep == 2
+
+
+def test_restore_then_continue_matches_uninterrupted_run(config: Path):
+    forcing = _forcing(6, seed=42)
+
+    reference = _initialized(config)
+    expected = [_step(reference, inputs) for inputs in forcing]
+
+    first_half = _initialized(config)
+    observed = [_step(first_half, inputs) for inputs in forcing[:3]]
+    _create(first_half)
+    payload = _state_bytes(first_half)
+    _free(first_half)
+
+    second_half = _initialized(config)
+    _restore(second_half, payload)
+    observed.extend(_step(second_half, inputs) for inputs in forcing[3:])
+
+    assert observed == expected
+    _assert_members_equal(_member_arrays(second_half), _member_arrays(reference))
+
+
+@pytest.mark.parametrize("kind", ["bytes", "bytearray", "memoryview", "uint8"])
+def test_restore_accepts_bytes_like_deliveries(config: Path, kind: str):
+    source, payload = _captured_after(config, steps=2)
+    delivered = {
+        "bytes": payload,
+        "bytearray": bytearray(payload),
+        "memoryview": memoryview(payload),
+        "uint8": np.frombuffer(payload, dtype="uint8").copy(),
+    }[kind]
+
+    target = _initialized(config)
+    _announce(target, len(payload))
+    target.set_value(bmi_lstm.SERIALIZATION_STATE, delivered)  # type: ignore[arg-type]
+    _assert_members_equal(_member_arrays(target), _member_arrays(source))
+    assert _outputs(target) == _outputs(source)
+
+
+def test_restored_state_is_independent_of_delivered_array(config: Path):
+    source, payload = _captured_after(config, steps=2)
+    delivered = np.frombuffer(payload, dtype="uint8").copy()
+
+    target = _initialized(config)
+    _announce(target, len(delivered))
+    target.set_value(bmi_lstm.SERIALIZATION_STATE, delivered)
+    delivered[codec.HEADER_SIZE:] = 0xFF
+
+    _assert_members_equal(_member_arrays(target), _member_arrays(source))
+    assert _outputs(target) == _outputs(source)
+
+
+def test_restore_state_method_and_apply_snapshot_direct(config: Path):
+    """Standalone callers may bypass set_value and use the public helpers."""
+    source, payload = _captured_after(config, steps=3)
+
+    target = _initialized(config)
+    target.restore_state(payload)
+    _assert_members_equal(_member_arrays(target), _member_arrays(source))
+
+    other = _initialized(config)
+    other.apply_snapshot(codec.unpack(payload))
+    _assert_members_equal(_member_arrays(other), _member_arrays(source))
+    assert _outputs(other) == _outputs(source)
+
+
+def test_matching_fingerprint_with_wrong_output_count_raises(config: Path):
+    source, _ = _captured_after(config, steps=2)
+    snapshot = source.snapshot()
+    snapshot.outputs = np.append(snapshot.outputs, 1.0)
+    payload = codec.pack(snapshot)
+
+    target = _initialized(config)
+    before = _observed(target)
+    with pytest.raises(codec.PayloadError, match="output"):
+        _restore(target, payload)
+    _assert_untouched(target, before)
+
+
+def test_matching_fingerprint_with_wrong_hidden_size_raises(config: Path):
+    source, _ = _captured_after(config, steps=2)
+    snapshot = source.snapshot()
+    hidden, cell = snapshot.members[-1]
+    snapshot.members[-1] = (np.append(hidden, np.float32(0)), np.append(cell, np.float32(0)))
+    payload = codec.pack(snapshot)
+
+    target = _initialized(config)
+    before = _observed(target)
+    with pytest.raises(codec.PayloadError, match="hidden size"):
+        _restore(target, payload)
+    _assert_untouched(target, before)
+
+
+def test_matching_fingerprint_with_wrong_member_count_raises(config: Path):
+    source, _ = _captured_after(config, steps=2)
+    snapshot = source.snapshot()
+    snapshot.members = snapshot.members + [snapshot.members[0]]
+    payload = codec.pack(snapshot)
+
+    target = _initialized(config)
+    before = _observed(target)
+    with pytest.raises(codec.PayloadError, match="ensemble members"):
+        _restore(target, payload)
+    _assert_untouched(target, before)
+
+
+def test_apply_snapshot_rejects_foreign_fingerprint_before_mutation(config: Path):
+    source, _ = _captured_after(config, steps=2)
+    snapshot = source.snapshot()
+    snapshot.fingerprint = snapshot.fingerprint + b";tampered"
+
+    target = _initialized(config)
+    before = _observed(target)
+    with pytest.raises(codec.PayloadError, match="fingerprint"):
+        target.apply_snapshot(snapshot)
+    _assert_untouched(target, before)
+
+
+def test_reserved_names_stay_out_of_var_lists_after_restore(config: Path):
+    _, payload = _captured_after(config, steps=1)
+    target = _initialized(config)
+    _restore(target, payload)
+    for name in bmi_lstm.SERIALIZATION_VAR_NAMES:
+        assert name not in target.get_input_var_names()
+        assert name not in target.get_output_var_names()
