@@ -383,6 +383,73 @@ def compute_fingerprint(members: typing.Sequence[EnsembleMember]) -> bytes:
     return ";".join(sections).encode("utf-8")
 
 
+# ---------------  ngen BMI Serialization Protocol  -----------------------------
+#
+# The four reserved variable names below are the surface of the ngen BMI
+# Serialization Protocol. They are discovered by name, never enumerated: they
+# do not appear in `get_input_var_names` / `get_output_var_names` and have no
+# spatial semantics, so `get_var_grid` and `get_var_location` keep raising for
+# them as for any unknown name. ngen decides whether a model conforms by an
+# exact string comparison of `get_var_units` on each name.
+
+SERIALIZATION_CREATE: typing.Final[str] = "ngen::serialization_create"
+"""trigger: capture a snapshot of the computed state into the payload buffer"""
+SERIALIZATION_FREE: typing.Final[str] = "ngen::serialization_free"
+"""trigger: release the payload buffer"""
+SERIALIZATION_SIZE: typing.Final[str] = "ngen::serialization_size"
+"""byte count of the payload buffer (read after create; set before restore)"""
+SERIALIZATION_STATE: typing.Final[str] = "ngen::serialization_state"
+"""the opaque payload bytes (read to serialize; set to restore)"""
+
+SERIALIZATION_TRIGGER_UNIT: typing.Final[str] = "ngen::trigger"
+SERIALIZATION_SIZE_UNIT: typing.Final[str] = "bytes"
+SERIALIZATION_OPAQUE_UNIT: typing.Final[str] = "ngen::opaque"
+
+SERIALIZATION_VAR_NAMES: typing.Final[tuple[str, ...]] = (
+    SERIALIZATION_CREATE,
+    SERIALIZATION_FREE,
+    SERIALIZATION_SIZE,
+    SERIALIZATION_STATE,
+)
+"""all reserved protocol names, in protocol-document order"""
+
+
+def build_serialization_state() -> State:
+    """
+    Create the `State` backing the four reserved protocol variables.
+
+    The two triggers are one-element int32 arrays, the size is a one-element
+    int64 array, and the state is an empty uint8 array (its `Var.value` is
+    replaced, not resized, whenever a payload is captured or released). The
+    arrays exist from construction so the names resolve for introspection
+    before `initialize()` is called.
+    """
+    return State(
+        vars=(
+            Var(
+                name=SERIALIZATION_CREATE,
+                unit=SERIALIZATION_TRIGGER_UNIT,
+                value=np.zeros(1, dtype="int32"),
+            ),
+            Var(
+                name=SERIALIZATION_FREE,
+                unit=SERIALIZATION_TRIGGER_UNIT,
+                value=np.zeros(1, dtype="int32"),
+            ),
+            Var(
+                name=SERIALIZATION_SIZE,
+                unit=SERIALIZATION_SIZE_UNIT,
+                value=np.zeros(1, dtype="int64"),
+            ),
+            Var(
+                name=SERIALIZATION_STATE,
+                unit=SERIALIZATION_OPAQUE_UNIT,
+                value=np.empty(0, dtype="uint8"),
+            ),
+        )
+    )
+
+
 # ---------------  LSTM BMI Wrapper  -----------------------------
 
 
@@ -409,6 +476,9 @@ class bmi_LSTM(BmiBase):
         # _bmi_ variable state; this is separate from lstm ensemble member state.
         self._dynamic_inputs = build_state(_dynamic_input_vars)
         self._outputs = build_state(_output_vars)
+        # reserved ngen serialization protocol variables; resolved by name only
+        # and deliberately kept out of the input / output name lists.
+        self._serialization = build_serialization_state()
 
         # current model timestep.
         # e.g. current time = self._timestep * self._timestep_size_s
@@ -543,7 +613,9 @@ class bmi_LSTM(BmiBase):
         return self.get_value_ptr(name).dtype.name
 
     def get_var_units(self, name: str) -> str:
-        return first_containing(name, self._outputs, self._dynamic_inputs).unit(name)
+        return first_containing(
+            name, self._outputs, self._dynamic_inputs, self._serialization
+        ).unit(name)
 
     def get_var_itemsize(self, name: str) -> int:
         return self.get_value_ptr(name).itemsize
@@ -578,7 +650,9 @@ class bmi_LSTM(BmiBase):
 
     def get_value_ptr(self, name: str) -> np.ndarray:
         """Returns a _reference_ to a variable's np.NDArray."""
-        return first_containing(name, self._outputs, self._dynamic_inputs).value(name)
+        return first_containing(
+            name, self._outputs, self._dynamic_inputs, self._serialization
+        ).value(name)
 
     def get_value_at_indices(
         self, name: str, dest: np.ndarray, inds: np.ndarray
