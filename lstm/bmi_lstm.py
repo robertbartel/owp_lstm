@@ -340,6 +340,49 @@ def scale_outputs(
     )
 
 
+# ---------------  Model Fingerprint  -----------------------------
+
+FINGERPRINT_PREFIX: typing.Final[str] = "lstm-bmi"
+"""Leading token of every fingerprint, so the text is recognizable in a hex dump."""
+
+
+def member_fingerprint(index: int, member: EnsembleMember) -> str:
+    """
+    Return the deterministic textual identity of a single ensemble member.
+
+    The text records, in order, the member's hidden size, its ordered input
+    names (dynamic inputs followed by static attributes, exactly as fed to the
+    model), the name of the trained-model run directory, and the epoch number
+    of the loaded weights. It is meant to be readable in a hex dump and is
+    compared as bytes, never parsed.
+    """
+    cfg = member.cfg
+    run_dir = Path(cfg["run_dir"]).name
+    return (
+        f"{index}:hidden={int(cfg['hidden_size'])},"
+        f"inputs={'|'.join(member.input_names)},"
+        f"run={run_dir},"
+        f"epoch={int(cfg['epochs'])}"
+    )
+
+
+def compute_fingerprint(members: typing.Sequence[EnsembleMember]) -> bytes:
+    """
+    Derive the UTF-8 fingerprint identifying an ensemble of members.
+
+    The fingerprint is ``lstm-bmi;members=<count>`` followed by one
+    :func:`member_fingerprint` section per member, in ensemble order, all
+    joined by ``;``. Two modules initialized from equivalent configurations
+    produce identical bytes; a change in member count, order, hidden size,
+    input names, trained-model run directory, or epoch changes the bytes.
+    """
+    sections = [FINGERPRINT_PREFIX, f"members={len(members)}"]
+    sections.extend(
+        member_fingerprint(index, member) for index, member in enumerate(members)
+    )
+    return ";".join(sections).encode("utf-8")
+
+
 # ---------------  LSTM BMI Wrapper  -----------------------------
 
 
@@ -376,6 +419,8 @@ class bmi_LSTM(BmiBase):
         # here, however the names are bound and initialized in `initialize`.
         self.cfg_bmi: dict[str, typing.Any]
         self.ensemble_members: list[EnsembleMember]
+        self._fingerprint: bytes
+        """model identity derived from the ensemble members; see `compute_fingerprint`"""
 
     def initialize(self, config_file: str) -> None:
         # read and setup main configuration file
@@ -423,6 +468,10 @@ class bmi_LSTM(BmiBase):
 
         # load static variables from config into state
         load_static_attributes(self.cfg_bmi["static_attributes"], self._static_inputs)
+
+        # identity of the fully constructed ensemble, used to reject state
+        # payloads produced by a differently configured module.
+        self._fingerprint = compute_fingerprint(self.ensemble_members)
 
     def update(self) -> None:
         """update a single timestep."""
