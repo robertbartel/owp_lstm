@@ -65,6 +65,7 @@ except ImportError:
     from yaml import SafeLoader
 
 from . import nextgen_cuda_lstm
+from . import serialization_codec
 from .base import BmiBase
 from .logger import configure_logging, logger
 from .model_state import State, StateFacade, Var
@@ -391,6 +392,13 @@ def compute_fingerprint(members: typing.Sequence[EnsembleMember]) -> bytes:
 # spatial semantics, so `get_var_grid` and `get_var_location` keep raising for
 # them as for any unknown name. ngen decides whether a model conforms by an
 # exact string comparison of `get_var_units` on each name.
+#
+# Capture is driven through `set_value`: the create trigger packs the computed
+# state (see `bmi_LSTM.snapshot`) into the state buffer and records its byte
+# length in the size variable; the free trigger releases the buffer. ngen
+# guarantees create and free are paired, but free is safe at any time, and
+# `finalize()` releases the buffer as well. Neither trigger alters the
+# computed state, so a capture mid-run cannot perturb later timesteps.
 
 SERIALIZATION_CREATE: typing.Final[str] = "ngen::serialization_create"
 """trigger: capture a snapshot of the computed state into the payload buffer"""
@@ -412,6 +420,16 @@ SERIALIZATION_VAR_NAMES: typing.Final[tuple[str, ...]] = (
     SERIALIZATION_STATE,
 )
 """all reserved protocol names, in protocol-document order"""
+
+
+def tensor_to_state_array(tensor: torch.Tensor) -> npt.NDArray[np.float32]:
+    """
+    Return an independent, flat float32 numpy copy of a member state tensor.
+
+    Member tensors are shaped (1, batch size 1, hidden size); the copy is
+    flattened to the hidden size, which is the layout the codec stores.
+    """
+    return np.array(tensor.detach().cpu().numpy(), dtype="float32").ravel()
 
 
 def build_serialization_state() -> State:
@@ -586,7 +604,9 @@ class bmi_LSTM(BmiBase):
         for _ in range(int(n_steps)):
             self.update()
 
-    def finalize(self) -> None: ...
+    def finalize(self) -> None:
+        # release any captured serialization payload; nothing else is held.
+        self._serialization_free()
 
     def get_component_name(self) -> str:
         return "LSTM"
@@ -662,6 +682,13 @@ class bmi_LSTM(BmiBase):
         ).value_at_indices(name, dest, inds)
 
     def set_value(self, name: str, src: np.ndarray) -> None:
+        # the protocol triggers are commands, not values: `src` is ignored.
+        if name == SERIALIZATION_CREATE:
+            self._serialization_create()
+            return None
+        if name == SERIALIZATION_FREE:
+            self._serialization_free()
+            return None
         return first_containing(name, self._outputs, self._dynamic_inputs).set_value(
             name, src
         )
@@ -691,6 +718,67 @@ class bmi_LSTM(BmiBase):
         if grid == 0:
             return "scalar"
         raise RuntimeError(f"unsupported grid type: {grid!s}. only support 0")
+
+    # ngen BMI Serialization Protocol: capture and release
+
+    def snapshot(self) -> serialization_codec.Snapshot:
+        """
+        Gather the module's computed state into a codec `Snapshot`.
+
+        The snapshot holds the timestep counter, the fingerprint, each ensemble
+        member's hidden and cell state as flat float32 copies (in ensemble
+        order), and the output values as float64 (in output variable order).
+        Nothing on the module is modified, and the returned arrays do not alias
+        the member tensors. Raises `RuntimeError` before `initialize()`.
+        """
+        if not hasattr(self, "_fingerprint"):
+            raise RuntimeError(
+                "cannot capture serialization state before initialize() is called"
+            )
+        members = [
+            (tensor_to_state_array(member.h_t), tensor_to_state_array(member.c_t))
+            for member in self.ensemble_members
+        ]
+        outputs = np.array(
+            [self._outputs.value(name)[0] for name in self._outputs.names()],
+            dtype=serialization_codec.OUTPUT_DTYPE,
+        )
+        return serialization_codec.Snapshot(
+            timestep=self._timestep,
+            fingerprint=self._fingerprint,
+            members=members,
+            outputs=outputs,
+        )
+
+    def capture_state(self) -> bytes:
+        """Pack `snapshot()` into payload bytes; see `serialization_codec`."""
+        return serialization_codec.pack(self.snapshot())
+
+    def _serialization_var(self, name: str) -> Var:
+        """Return the `Var` backing a reserved protocol name."""
+        for var in self._serialization:
+            if var.name == name:
+                return var
+        raise KeyError(f"unknown serialization name: {name!s}")
+
+    def _serialization_create(self) -> None:
+        """
+        Handle the create trigger: capture the state into the payload buffer.
+
+        The buffer and size are only replaced once packing has succeeded, so a
+        failed capture (e.g. before `initialize()`) leaves both untouched.
+        """
+        payload = self.capture_state()
+        # an owned, writable uint8 copy; `len()` equals the size reported below.
+        self._serialization_var(SERIALIZATION_STATE).value = np.frombuffer(
+            payload, dtype="uint8"
+        ).copy()
+        self._serialization.set_value(SERIALIZATION_SIZE, len(payload))
+
+    def _serialization_free(self) -> None:
+        """Handle the free trigger: release the payload buffer. Safe at any time."""
+        self._serialization_var(SERIALIZATION_STATE).value = np.empty(0, dtype="uint8")
+        self._serialization.set_value(SERIALIZATION_SIZE, 0)
 
 
 def coerce_config(cfg: dict[str, typing.Any]):

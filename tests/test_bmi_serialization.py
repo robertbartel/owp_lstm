@@ -317,3 +317,295 @@ def test_build_serialization_state_standalone():
         assert state.unit(name) == unit
         assert state.value(name).dtype == np.dtype(dtype)
         assert state.value(name).itemsize == itemsize
+
+
+# ---------------  capture and release (create / free triggers)  -----------------------------
+
+from lstm import serialization_codec as codec  # noqa: E402
+
+TRIGGER = np.array([1], dtype="int32")
+"""a trigger value; the protocol says the value is ignored"""
+
+
+def _forcing(steps: int, seed: int = 0) -> list[dict[str, float]]:
+    """Deterministic per-step input values for every dynamic input name."""
+    rng = np.random.default_rng(seed)
+    names = [name for name, _ in bmi_lstm._dynamic_input_vars]
+    return [{name: float(rng.uniform(0.0, 10.0)) for name in names} for _ in range(steps)]
+
+
+def _step(model: bmi_lstm.bmi_LSTM, inputs: dict[str, float]) -> dict[str, float]:
+    """Set every dynamic input, update once, and return the outputs by name."""
+    for name, value in inputs.items():
+        model.set_value(name, np.array([value], dtype="float64"))
+    model.update()
+    return {name: float(model.get_value_ptr(name)[0]) for name in model.get_output_var_names()}
+
+
+def _create(model: bmi_lstm.bmi_LSTM) -> None:
+    model.set_value(bmi_lstm.SERIALIZATION_CREATE, TRIGGER)
+
+
+def _free(model: bmi_lstm.bmi_LSTM) -> None:
+    model.set_value(bmi_lstm.SERIALIZATION_FREE, TRIGGER)
+
+
+def _size(model: bmi_lstm.bmi_LSTM) -> int:
+    return int(model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE)[0])
+
+
+def _state_bytes(model: bmi_lstm.bmi_LSTM) -> bytes:
+    return model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).tobytes()
+
+
+def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Flat float32 copies of every member's (hidden, cell) tensors, read directly."""
+    return [
+        (m.h_t.numpy().ravel().copy(), m.c_t.numpy().ravel().copy())
+        for m in model.ensemble_members
+    ]
+
+
+@pytest.fixture(params=["single", "double"])
+def config(request: pytest.FixtureRequest, two_member_config: Path) -> Path:
+    return SINGLE_MEMBER_CONFIG if request.param == "single" else two_member_config
+
+
+def test_create_size_equals_state_length_and_packed_bytes(config: Path):
+    model = _initialized(config)
+    for inputs in _forcing(3):
+        _step(model, inputs)
+
+    _create(model)
+
+    packed = model.capture_state()
+    state_ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    assert state_ptr.dtype == np.dtype("uint8")
+    assert _size(model) == len(state_ptr) == len(packed)
+    assert _size(model) == model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE)
+    assert _size(model) > codec.HEADER_SIZE
+    assert state_ptr.tobytes() == packed
+    assert packed.startswith(codec.MAGIC)
+
+
+def test_consecutive_size_and_state_reads_are_identical(config: Path):
+    model = _initialized(config)
+    _step(model, _forcing(1)[0])
+    _create(model)
+
+    size_a = model.get_value(bmi_lstm.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
+    size_b = model.get_value(bmi_lstm.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
+    np.testing.assert_array_equal(size_a, size_b)
+    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE) is model.get_value_ptr(
+        bmi_lstm.SERIALIZATION_SIZE
+    )
+
+    n = model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) // model.get_var_itemsize(
+        bmi_lstm.SERIALIZATION_STATE
+    )
+    state_a = model.get_value(bmi_lstm.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
+    state_b = model.get_value(bmi_lstm.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
+    np.testing.assert_array_equal(state_a, state_b)
+    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is model.get_value_ptr(
+        bmi_lstm.SERIALIZATION_STATE
+    )
+    assert state_a.tobytes() == _state_bytes(model)
+
+
+def test_create_free_then_update_matches_update_without_capture(config: Path):
+    plain = _initialized(config)
+    captured = _initialized(config)
+
+    for inputs in _forcing(6, seed=1):
+        expected = _step(plain, inputs)
+        _create(captured)
+        _free(captured)
+        actual = _step(captured, inputs)
+        # bitwise: capturing must not perturb the computed state
+        assert actual == expected
+
+    assert captured.get_current_time() == plain.get_current_time()
+    for (h_a, c_a), (h_b, c_b) in zip(_member_arrays(plain), _member_arrays(captured)):
+        np.testing.assert_array_equal(h_a, h_b)
+        np.testing.assert_array_equal(c_a, c_b)
+
+
+def test_capture_between_updates_does_not_change_state(config: Path):
+    """A create left outstanding (no free) across updates is equally inert."""
+    plain = _initialized(config)
+    captured = _initialized(config)
+
+    for inputs in _forcing(4, seed=2):
+        expected = _step(plain, inputs)
+        actual = _step(captured, inputs)
+        assert actual == expected
+        _create(captured)  # outstanding until the next iteration
+
+    for (h_a, c_a), (h_b, c_b) in zip(_member_arrays(plain), _member_arrays(captured)):
+        np.testing.assert_array_equal(h_a, h_b)
+        np.testing.assert_array_equal(c_a, c_b)
+
+
+def test_free_before_any_create_does_not_raise(module: bmi_lstm.bmi_LSTM):
+    _free(module)
+    _free(module)
+    assert _size(module) == 0
+    assert len(module.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+
+
+def test_create_before_initialize_raises_and_free_still_safe():
+    model = bmi_lstm.bmi_LSTM()
+    with pytest.raises(RuntimeError, match="initialize"):
+        _create(model)
+    # a failed create leaves the buffer untouched ...
+    assert _size(model) == 0
+    assert len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    # ... and free afterwards is still safe
+    _free(model)
+    assert _size(model) == 0
+    with pytest.raises(RuntimeError, match="initialize"):
+        model.capture_state()
+
+
+@pytest.mark.parametrize("steps", [0, 1, 5])
+def test_captured_bytes_unpack_to_current_state(config: Path, steps: int):
+    model = _initialized(config)
+    for inputs in _forcing(steps, seed=3):
+        _step(model, inputs)
+
+    _create(model)
+    snapshot = codec.unpack(_state_bytes(model), expected_fingerprint=model._fingerprint)
+
+    assert snapshot.timestep == steps
+    assert model.get_current_time() == steps * model.get_time_step()
+    assert snapshot.fingerprint == model._fingerprint
+
+    expected_outputs = np.array(
+        [model.get_value_ptr(name)[0] for name in model.get_output_var_names()],
+        dtype="float64",
+    )
+    np.testing.assert_array_equal(snapshot.outputs, expected_outputs)
+    if steps == 0:
+        np.testing.assert_array_equal(snapshot.outputs, np.zeros(2))
+
+    assert len(snapshot.members) == len(model.ensemble_members)
+    for (hidden, cell), (h_t, c_t) in zip(snapshot.members, _member_arrays(model)):
+        assert hidden.dtype == np.dtype("float32")
+        assert hidden.shape == h_t.shape == (model.ensemble_members[0].cfg["hidden_size"],)
+        np.testing.assert_array_equal(hidden, h_t)
+        np.testing.assert_array_equal(cell, c_t)
+        if steps == 0:
+            assert not hidden.any() and not cell.any()
+        else:
+            assert hidden.any() and cell.any()
+
+
+def test_snapshot_arrays_do_not_alias_member_tensors():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    _step(model, _forcing(1)[0])
+    before = _member_arrays(model)
+
+    snapshot = model.snapshot()
+    for hidden, cell in snapshot.members:
+        hidden[:] = 123.0
+        cell[:] = 456.0
+    snapshot.outputs[:] = -1.0
+
+    for (h_t, c_t), (h_before, c_before) in zip(_member_arrays(model), before):
+        np.testing.assert_array_equal(h_t, h_before)
+        np.testing.assert_array_equal(c_t, c_before)
+    for name in model.get_output_var_names():
+        assert model.get_value_ptr(name)[0] != -1.0
+
+
+@pytest.mark.parametrize("value", [0, 1, 7, -1])
+def test_trigger_value_is_ignored(value: int):
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    _step(model, _forcing(1)[0])
+    reference = model.capture_state()
+
+    model.set_value(bmi_lstm.SERIALIZATION_CREATE, np.array([value], dtype="int32"))
+    assert _state_bytes(model) == reference
+    model.set_value(bmi_lstm.SERIALIZATION_FREE, np.array([value], dtype="int32"))
+    assert _size(model) == 0
+
+
+def test_free_releases_captured_buffer():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    _step(model, _forcing(1)[0])
+    _create(model)
+    assert _size(model) > 0
+
+    _free(model)
+    assert _size(model) == 0
+    state_ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    assert state_ptr.dtype == np.dtype("uint8")
+    assert state_ptr.shape == (0,)
+    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+    # type and units survive a release
+    assert model.get_var_type(bmi_lstm.SERIALIZATION_STATE) == "uint8"
+    assert model.get_var_units(bmi_lstm.SERIALIZATION_STATE) == "ngen::opaque"
+
+
+def test_finalize_releases_captured_buffer():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    _step(model, _forcing(1)[0])
+    _create(model)
+    assert _size(model) > 0
+
+    model.finalize()
+    assert _size(model) == 0
+    assert len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+
+
+def test_finalize_safe_without_initialize():
+    model = bmi_lstm.bmi_LSTM()
+    model.finalize()
+    assert _size(model) == 0
+
+
+def test_recapture_replaces_buffer_with_new_state():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    forcing = _forcing(2, seed=4)
+    _step(model, forcing[0])
+    _create(model)
+    first = _state_bytes(model)
+
+    _step(model, forcing[1])
+    _create(model)
+    second = _state_bytes(model)
+
+    assert len(first) == len(second) == _size(model)
+    assert first != second
+    assert codec.unpack(first).timestep == 1
+    assert codec.unpack(second).timestep == 2
+
+
+def test_captured_buffer_is_independent_of_later_updates():
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    forcing = _forcing(3, seed=5)
+    _step(model, forcing[0])
+    _create(model)
+    ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    frozen = ptr.tobytes()
+
+    for inputs in forcing[1:]:
+        _step(model, inputs)
+
+    # the buffer is a snapshot, not a view onto the live tensors
+    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is ptr
+    assert ptr.tobytes() == frozen
+    assert codec.unpack(frozen).timestep == 1
+    assert _size(model) == len(frozen)
+
+
+def test_size_and_state_stay_within_serialization_state_only():
+    """Capturing must not leak the reserved names into the public var lists."""
+    model = _initialized(SINGLE_MEMBER_CONFIG)
+    _create(model)
+    for name in RESERVED:
+        assert name not in model.get_input_var_names()
+        assert name not in model.get_output_var_names()
+    assert model.get_input_item_count() == len(bmi_lstm._dynamic_input_vars)
+    assert model.get_output_item_count() == len(bmi_lstm._output_vars)
