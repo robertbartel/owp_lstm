@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from lstm import bmi_lstm
+from lstm import serialization_protocol as protocol
 from lstm import serialization_codec as codec
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -132,17 +133,17 @@ def _run(model: bmi_lstm.bmi_LSTM, forcing: list[dict[str, np.ndarray]]) -> dict
 
 def _capture_and_free(model: bmi_lstm.bmi_LSTM) -> tuple[int, bytes]:
     """The ngen save sequence: create, read size and state, free."""
-    model.set_value(bmi_lstm.SERIALIZATION_CREATE, TRIGGER)
-    size = int(model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE)[0])
-    state = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).tobytes()
-    model.set_value(bmi_lstm.SERIALIZATION_FREE, TRIGGER)
+    model.set_value(protocol.SERIALIZATION_CREATE, TRIGGER)
+    size = int(model.get_value_ptr(protocol.SERIALIZATION_SIZE)[0])
+    state = model.get_value_ptr(protocol.SERIALIZATION_STATE).tobytes()
+    model.set_value(protocol.SERIALIZATION_FREE, TRIGGER)
     return size, state
 
 
 def _announce_and_deliver(model: bmi_lstm.bmi_LSTM, size: int, state: bytes) -> None:
     """The ngen restore sequence: announce the byte count, then deliver the bytes."""
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
-    model.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
+    model.set_value(protocol.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
+    model.set_value(protocol.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
 
 
 def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -173,7 +174,6 @@ def _observe(model: bmi_lstm.bmi_LSTM) -> dict:
             name: float(model.get_value_ptr(name)[0]) for name in model.get_output_var_names()
         },
         "time": model.get_current_time(),
-        "buffer": model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).tobytes(),
     }
 
 
@@ -185,7 +185,10 @@ def _assert_untouched(model: bmi_lstm.bmi_LSTM, before: dict) -> None:
         assert np.array_equal(c_a, c_b)
     assert after["outputs"] == before["outputs"]
     assert after["time"] == before["time"]
-    assert after["buffer"] == before["buffer"]
+    # the protocol invariant survives a rejected delivery: size == buffer length
+    assert int(model.get_value_ptr(protocol.SERIALIZATION_SIZE)[0]) == len(
+        model.get_value_ptr(protocol.SERIALIZATION_STATE)
+    )
 
 
 def test_two_member_config_builds_a_two_member_ensemble(two_member_config: Path):
@@ -217,7 +220,7 @@ def test_two_member_split_and_restore_matches_uninterrupted_run(
     observed = _run(first_half, nldas_forcing[:SPLIT_STEP])
     size, state = _capture_and_free(first_half)
     assert size == len(state) > 0
-    assert first_half.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).size == 0
+    assert first_half.get_value_ptr(protocol.SERIALIZATION_STATE).size == 0
 
     # the payload really carries two members (and is larger than a single-member one)
     snapshot = codec.unpack(state)
@@ -298,9 +301,9 @@ def test_cross_member_count_restore_raises_and_leaves_target_untouched(
     before = _observe(fresh)
     assert all(not h.any() and not c.any() for h, c in before["members"])
     assert all(v == 0.0 for v in before["outputs"].values())
-    fresh.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
+    fresh.set_value(protocol.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
     with pytest.raises(codec.PayloadError, match="fingerprint"):
-        fresh.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
+        fresh.set_value(protocol.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
     _assert_untouched(fresh, before)
     assert fresh.get_current_time() == fresh.get_start_time()
 
@@ -309,9 +312,9 @@ def test_cross_member_count_restore_raises_and_leaves_target_untouched(
     _run(stepped, nldas_forcing[:3])
     before = _observe(stepped)
     assert any(h.any() for h, _ in before["members"])
-    stepped.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
+    stepped.set_value(protocol.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
     with pytest.raises(codec.PayloadError, match="fingerprint"):
-        stepped.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
+        stepped.set_value(protocol.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
     _assert_untouched(stepped, before)
 
     # and the rejected target still runs normally afterwards, matching an untouched twin

@@ -66,6 +66,16 @@ except ImportError:
 
 from . import nextgen_cuda_lstm
 from . import serialization_codec
+from .serialization_protocol import SerializationProtocol
+# The reserved protocol names are defined by `serialization_protocol`. They are
+# imported here (not re-defined) so callers written against this module before
+# the protocol had its own module can still reach them through it.
+from .serialization_protocol import (  # noqa: F401
+    SERIALIZATION_CREATE,
+    SERIALIZATION_FREE,
+    SERIALIZATION_SIZE,
+    SERIALIZATION_STATE,
+)
 from .base import BmiBase
 from .logger import configure_logging, logger
 from .model_state import State, StateFacade, Var
@@ -422,90 +432,6 @@ def compute_fingerprint(members: typing.Sequence[EnsembleMember]) -> bytes:
     return ";".join(sections).encode("utf-8")
 
 
-# ---------------  ngen BMI Serialization Protocol  -----------------------------
-#
-# The four reserved variable names below are the surface of the ngen BMI
-# Serialization Protocol. They are discovered by name, never enumerated: they
-# do not appear in `get_input_var_names` / `get_output_var_names` and have no
-# spatial semantics, so `get_var_grid` and `get_var_location` keep raising for
-# them as for any unknown name. ngen decides whether a model conforms by an
-# exact string comparison of `get_var_units` on each name.
-#
-# Capture is driven through `set_value`: the create trigger packs the computed
-# state (see `bmi_LSTM.snapshot`) into the state buffer and records its byte
-# length in the size variable; the free trigger releases the buffer. ngen
-# guarantees create and free are paired, but free is safe at any time, and
-# `finalize()` releases the buffer as well. Neither trigger alters the
-# computed state, so a capture mid-run cannot perturb later timesteps.
-#
-# Restore is driven through `set_value` as an ordered pair of calls: the size
-# variable announces the incoming byte count (which `get_var_nbytes` on the
-# state variable then reports, because ngen's Python adapter sizes the array
-# it delivers from it), and the state variable delivers the payload. Delivery
-# is atomic: the payload is fully decoded and checked against the module's
-# fingerprint and member layout before any member tensor or output value is
-# written, so a rejected payload leaves the module exactly as `initialize()`
-# left it. The payload's timestep is carried but not applied, and the
-# capture buffer is not touched by a restore.
-
-SERIALIZATION_CREATE: typing.Final[str] = "ngen::serialization_create"
-"""trigger: capture a snapshot of the computed state into the payload buffer"""
-SERIALIZATION_FREE: typing.Final[str] = "ngen::serialization_free"
-"""trigger: release the payload buffer"""
-SERIALIZATION_SIZE: typing.Final[str] = "ngen::serialization_size"
-"""byte count of the payload buffer (read after create; set before restore)"""
-SERIALIZATION_STATE: typing.Final[str] = "ngen::serialization_state"
-"""the opaque payload bytes (read to serialize; set to restore)"""
-
-SERIALIZATION_TRIGGER_UNIT: typing.Final[str] = "ngen::trigger"
-SERIALIZATION_SIZE_UNIT: typing.Final[str] = "bytes"
-SERIALIZATION_OPAQUE_UNIT: typing.Final[str] = "ngen::opaque"
-
-SERIALIZATION_VAR_NAMES: typing.Final[tuple[str, ...]] = (
-    SERIALIZATION_CREATE,
-    SERIALIZATION_FREE,
-    SERIALIZATION_SIZE,
-    SERIALIZATION_STATE,
-)
-"""all reserved protocol names, in protocol-document order"""
-
-
-def build_serialization_state() -> State:
-    """
-    Create the `State` backing the four reserved protocol variables.
-
-    The two triggers are one-element int32 arrays, the size is a one-element
-    int64 array, and the state is an empty uint8 array (its `Var.value` is
-    replaced, not resized, whenever a payload is captured or released). The
-    arrays exist from construction so the names resolve for introspection
-    before `initialize()` is called.
-    """
-    return State(
-        vars=(
-            Var(
-                name=SERIALIZATION_CREATE,
-                unit=SERIALIZATION_TRIGGER_UNIT,
-                value=np.zeros(1, dtype="int32"),
-            ),
-            Var(
-                name=SERIALIZATION_FREE,
-                unit=SERIALIZATION_TRIGGER_UNIT,
-                value=np.zeros(1, dtype="int32"),
-            ),
-            Var(
-                name=SERIALIZATION_SIZE,
-                unit=SERIALIZATION_SIZE_UNIT,
-                value=np.zeros(1, dtype="int64"),
-            ),
-            Var(
-                name=SERIALIZATION_STATE,
-                unit=SERIALIZATION_OPAQUE_UNIT,
-                value=np.empty(0, dtype="uint8"),
-            ),
-        )
-    )
-
-
 # ---------------  LSTM BMI Wrapper  -----------------------------
 
 
@@ -532,9 +458,16 @@ class bmi_LSTM(BmiBase):
         # _bmi_ variable state; this is separate from lstm ensemble member state.
         self._dynamic_inputs = build_state(_dynamic_input_vars)
         self._outputs = build_state(_output_vars)
-        # reserved ngen serialization protocol variables; resolved by name only
-        # and deliberately kept out of the input / output name lists.
-        self._serialization = build_serialization_state()
+        # the four reserved ngen serialization protocol variables (see
+        # `serialization_protocol`), wired to pack and unpack this module's
+        # `snapshot()`. They resolve by name only and are deliberately kept out
+        # of the input / output name lists.
+        self._serialization = SerializationProtocol(
+            capture=lambda: serialization_codec.pack(self.snapshot()),
+            restore=lambda payload: self.apply_snapshot(
+                serialization_codec.unpack(payload)
+            ),
+        )
 
         # current model timestep.
         # e.g. current time = self._timestep * self._timestep_size_s
@@ -644,7 +577,7 @@ class bmi_LSTM(BmiBase):
 
     def finalize(self) -> None:
         # release any captured serialization payload; nothing else is held.
-        self._serialization_free()
+        self._serialization.release()
 
     def get_component_name(self) -> str:
         return "LSTM"
@@ -679,12 +612,6 @@ class bmi_LSTM(BmiBase):
         return self.get_value_ptr(name).itemsize
 
     def get_var_nbytes(self, name: str) -> int:
-        if name == SERIALIZATION_STATE:
-            # the byte count recorded by the last create or announced by the
-            # last `set_value` on the size variable. ngen's Python adapter
-            # sizes the array it delivers on restore from this value, so it
-            # must reflect the announcement even while the buffer is empty.
-            return int(self._serialization.value(SERIALIZATION_SIZE)[0])
         return self.get_var_itemsize(name) * len(self.get_value_ptr(name))
 
     def get_var_location(self, name: str) -> str:
@@ -726,20 +653,10 @@ class bmi_LSTM(BmiBase):
         ).value_at_indices(name, dest, inds)
 
     def set_value(self, name: str, src: np.ndarray) -> None:
-        # the protocol triggers are commands, not values: `src` is ignored.
-        if name == SERIALIZATION_CREATE:
-            self._serialization_create()
-            return None
-        if name == SERIALIZATION_FREE:
-            self._serialization_free()
-            return None
-        # the restore path: announce the incoming byte count, then deliver.
-        if name == SERIALIZATION_SIZE:
-            self._serialization_announce(src)
-            return None
-        if name == SERIALIZATION_STATE:
-            self.restore_state(src)
-            return None
+        # the reserved protocol names are triggers, an announcement, or a
+        # payload delivery rather than values; the protocol object dispatches.
+        if name in self._serialization:
+            return self._serialization.set_value(name, src)
         return first_containing(name, self._outputs, self._dynamic_inputs).set_value(
             name, src
         )
@@ -770,7 +687,11 @@ class bmi_LSTM(BmiBase):
             return "scalar"
         raise RuntimeError(f"unsupported grid type: {grid!s}. only support 0")
 
-    # ngen BMI Serialization Protocol: capture and release
+    # Computed-state transfer for the ngen BMI Serialization Protocol. The
+    # protocol's reserved variables, buffer, and dispatch live in
+    # `serialization_protocol`; the payload format lives in
+    # `serialization_codec`. This class contributes only the model identity
+    # and the two methods that move state into and out of a `Snapshot`.
 
     def _require_initialized(self, action: str) -> None:
         """Raise `RuntimeError` naming `action` unless `initialize()` has run."""
@@ -810,75 +731,6 @@ class bmi_LSTM(BmiBase):
             outputs=outputs,
         )
 
-    def capture_state(self) -> bytes:
-        """Pack `snapshot()` into payload bytes; see `serialization_codec`."""
-        return serialization_codec.pack(self.snapshot())
-
-    def _serialization_var(self, name: str) -> Var:
-        """Return the `Var` backing a reserved protocol name."""
-        for var in self._serialization:
-            if var.name == name:
-                return var
-        raise KeyError(f"unknown serialization name: {name!s}")
-
-    def _serialization_create(self) -> None:
-        """
-        Handle the create trigger: capture the state into the payload buffer.
-
-        The buffer and size are only replaced once packing has succeeded, so a
-        failed capture (e.g. before `initialize()`) leaves both untouched.
-        """
-        payload = self.capture_state()
-        # an owned, writable uint8 copy; `len()` equals the size reported below.
-        self._serialization_var(SERIALIZATION_STATE).value = np.frombuffer(
-            payload, dtype="uint8"
-        ).copy()
-        self._serialization.set_value(SERIALIZATION_SIZE, len(payload))
-
-    def _serialization_free(self) -> None:
-        """Handle the free trigger: release the payload buffer. Safe at any time."""
-        self._serialization_var(SERIALIZATION_STATE).value = np.empty(0, dtype="uint8")
-        self._serialization.set_value(SERIALIZATION_SIZE, 0)
-
-    # ngen BMI Serialization Protocol: restore
-
-    def _serialization_announce(self, src: npt.ArrayLike) -> None:
-        """
-        Handle `set_value` on the size variable: record the announced byte
-        count of the payload about to be delivered.
-
-        `src` must hold exactly one non-negative integer. Only the size array
-        is written; the capture buffer is left as is.
-        """
-        announced = np.asarray(src).ravel()
-        if announced.size != 1:
-            raise ValueError(
-                f"{SERIALIZATION_SIZE} expects exactly one value, got {announced.size}"
-            )
-        count = int(announced[0])
-        if count < 0:
-            raise ValueError(f"{SERIALIZATION_SIZE} must be non-negative, got {count}")
-        self._serialization.set_value(SERIALIZATION_SIZE, count)
-
-    def restore_state(
-        self, payload: typing.Union[bytes, bytearray, memoryview, npt.NDArray[np.uint8]]
-    ) -> None:
-        """
-        Handle `set_value` on the state variable: decode `payload` and apply
-        it to the module's computed state.
-
-        The payload is fully validated by the codec, its fingerprint compared
-        against this module's, and its member layout and output count checked
-        against the initialized ensemble before anything is written; a
-        `serialization_codec.PayloadError` (or `RuntimeError` before
-        `initialize()`) therefore leaves every member tensor and output value
-        untouched. On success each member's hidden and cell tensors and the
-        output values are replaced. The payload's timestep is not applied and
-        the capture buffer is not modified.
-        """
-        self._require_initialized("restore serialization state")
-        self.apply_snapshot(serialization_codec.unpack(payload))
-
     def apply_snapshot(self, snapshot: serialization_codec.Snapshot) -> None:
         """
         Write a codec `Snapshot` into the member tensors and output values.
@@ -887,7 +739,9 @@ class bmi_LSTM(BmiBase):
         hidden and cell sizes, output count. Every check is made before the
         first assignment, so a rejected snapshot mutates nothing. This is the
         only place the fingerprint is compared. The snapshot's timestep is
-        deliberately not applied; see the protocol notes above.
+        deliberately not applied: the module's clock after a restore is
+        whatever `initialize()` set, and ngen advances the model relative to
+        its own time (see the README's serialization section).
         """
         self._require_initialized("restore serialization state")
         fingerprint = bytes(snapshot.fingerprint)

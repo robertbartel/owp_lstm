@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from lstm import bmi_lstm
+from lstm import serialization_protocol as protocol
 
 REPO_ROOT = Path(__file__).parent.parent
 SINGLE_MEMBER_CONFIG = REPO_ROOT / "configs/02064000_nh_NLDAS_hourly.yml"
@@ -169,23 +170,23 @@ def test_fingerprint_stable_across_updates():
 # ---------------  protocol surface (reserved variables)  -----------------------------
 
 RESERVED = {
-    bmi_lstm.SERIALIZATION_CREATE: ("ngen::trigger", "int32", 4),
-    bmi_lstm.SERIALIZATION_FREE: ("ngen::trigger", "int32", 4),
-    bmi_lstm.SERIALIZATION_SIZE: ("bytes", "int64", 8),
-    bmi_lstm.SERIALIZATION_STATE: ("ngen::opaque", "uint8", 1),
+    protocol.SERIALIZATION_CREATE: ("ngen::trigger", "int32", 4),
+    protocol.SERIALIZATION_FREE: ("ngen::trigger", "int32", 4),
+    protocol.SERIALIZATION_SIZE: ("bytes", "int64", 8),
+    protocol.SERIALIZATION_STATE: ("ngen::opaque", "uint8", 1),
 }
 """expected (unit, type, itemsize) per reserved name, per the ngen protocol"""
 
 
 def test_reserved_name_constants_are_exact():
-    assert bmi_lstm.SERIALIZATION_CREATE == "ngen::serialization_create"
-    assert bmi_lstm.SERIALIZATION_FREE == "ngen::serialization_free"
-    assert bmi_lstm.SERIALIZATION_SIZE == "ngen::serialization_size"
-    assert bmi_lstm.SERIALIZATION_STATE == "ngen::serialization_state"
-    assert bmi_lstm.SERIALIZATION_VAR_NAMES == tuple(RESERVED)
-    assert bmi_lstm.SERIALIZATION_TRIGGER_UNIT == "ngen::trigger"
-    assert bmi_lstm.SERIALIZATION_SIZE_UNIT == "bytes"
-    assert bmi_lstm.SERIALIZATION_OPAQUE_UNIT == "ngen::opaque"
+    assert protocol.SERIALIZATION_CREATE == "ngen::serialization_create"
+    assert protocol.SERIALIZATION_FREE == "ngen::serialization_free"
+    assert protocol.SERIALIZATION_SIZE == "ngen::serialization_size"
+    assert protocol.SERIALIZATION_STATE == "ngen::serialization_state"
+    assert protocol.SERIALIZATION_VAR_NAMES == tuple(RESERVED)
+    assert protocol.SERIALIZATION_TRIGGER_UNIT == "ngen::trigger"
+    assert protocol.SERIALIZATION_SIZE_UNIT == "bytes"
+    assert protocol.SERIALIZATION_OPAQUE_UNIT == "ngen::opaque"
 
 
 @pytest.fixture(params=["uninitialized", "initialized"])
@@ -264,25 +265,25 @@ def test_unknown_name_still_raises_same_as_reserved(module: bmi_lstm.bmi_LSTM):
 
 
 def test_size_reads_zero_and_state_reads_empty_when_fresh(module: bmi_lstm.bmi_LSTM):
-    size_ptr = module.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE)
+    size_ptr = module.get_value_ptr(protocol.SERIALIZATION_SIZE)
     assert size_ptr.shape == (1,)
     assert size_ptr[0] == 0
 
-    size = module.get_value(bmi_lstm.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
+    size = module.get_value(protocol.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
     assert size.dtype == np.dtype("int64")
     assert size[0] == 0
 
-    state_ptr = module.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    state_ptr = module.get_value_ptr(protocol.SERIALIZATION_STATE)
     assert state_ptr.dtype == np.dtype("uint8")
     assert state_ptr.shape == (0,)
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+    assert module.get_var_nbytes(protocol.SERIALIZATION_STATE) == 0
 
-    state = module.get_value(bmi_lstm.SERIALIZATION_STATE, np.empty(0, dtype="uint8"))
+    state = module.get_value(protocol.SERIALIZATION_STATE, np.empty(0, dtype="uint8"))
     assert state.shape == (0,)
 
 
 @pytest.mark.parametrize(
-    "name", [bmi_lstm.SERIALIZATION_CREATE, bmi_lstm.SERIALIZATION_FREE]
+    "name", [protocol.SERIALIZATION_CREATE, protocol.SERIALIZATION_FREE]
 )
 def test_trigger_arrays_are_single_int32(module: bmi_lstm.bmi_LSTM, name: str):
     ptr = module.get_value_ptr(name)
@@ -312,15 +313,6 @@ def test_reserved_state_is_per_instance():
         assert a.get_value_ptr(name) is not b.get_value_ptr(name)
 
 
-def test_build_serialization_state_standalone():
-    state = bmi_lstm.build_serialization_state()
-    assert tuple(state.names()) == bmi_lstm.SERIALIZATION_VAR_NAMES
-    for name, (unit, dtype, itemsize) in RESERVED.items():
-        assert state.unit(name) == unit
-        assert state.value(name).dtype == np.dtype(dtype)
-        assert state.value(name).itemsize == itemsize
-
-
 # ---------------  capture and release (create / free triggers)  -----------------------------
 
 from lstm import serialization_codec as codec  # noqa: E402
@@ -345,19 +337,19 @@ def _step(model: bmi_lstm.bmi_LSTM, inputs: dict[str, float]) -> dict[str, float
 
 
 def _create(model: bmi_lstm.bmi_LSTM) -> None:
-    model.set_value(bmi_lstm.SERIALIZATION_CREATE, TRIGGER)
+    model.set_value(protocol.SERIALIZATION_CREATE, TRIGGER)
 
 
 def _free(model: bmi_lstm.bmi_LSTM) -> None:
-    model.set_value(bmi_lstm.SERIALIZATION_FREE, TRIGGER)
+    model.set_value(protocol.SERIALIZATION_FREE, TRIGGER)
 
 
 def _size(model: bmi_lstm.bmi_LSTM) -> int:
-    return int(model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE)[0])
+    return int(model.get_value_ptr(protocol.SERIALIZATION_SIZE)[0])
 
 
 def _state_bytes(model: bmi_lstm.bmi_LSTM) -> bytes:
-    return model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).tobytes()
+    return model.get_value_ptr(protocol.SERIALIZATION_STATE).tobytes()
 
 
 def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -377,11 +369,11 @@ def test_create_size_equals_state_length_and_packed_bytes(config: Path):
 
     _create(model)
 
-    packed = model.capture_state()
-    state_ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    packed = codec.pack(model.snapshot())
+    state_ptr = model.get_value_ptr(protocol.SERIALIZATION_STATE)
     assert state_ptr.dtype == np.dtype("uint8")
     assert _size(model) == len(state_ptr) == len(packed)
-    assert _size(model) == model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE)
+    assert _size(model) == model.get_var_nbytes(protocol.SERIALIZATION_STATE)
     assert _size(model) > codec.HEADER_SIZE
     assert state_ptr.tobytes() == packed
     assert packed.startswith(codec.MAGIC)
@@ -392,21 +384,21 @@ def test_consecutive_size_and_state_reads_are_identical(config: Path):
     _step(model, _forcing(1)[0])
     _create(model)
 
-    size_a = model.get_value(bmi_lstm.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
-    size_b = model.get_value(bmi_lstm.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
+    size_a = model.get_value(protocol.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
+    size_b = model.get_value(protocol.SERIALIZATION_SIZE, np.empty(1, dtype="int64"))
     np.testing.assert_array_equal(size_a, size_b)
-    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE) is model.get_value_ptr(
-        bmi_lstm.SERIALIZATION_SIZE
+    assert model.get_value_ptr(protocol.SERIALIZATION_SIZE) is model.get_value_ptr(
+        protocol.SERIALIZATION_SIZE
     )
 
-    n = model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) // model.get_var_itemsize(
-        bmi_lstm.SERIALIZATION_STATE
+    n = model.get_var_nbytes(protocol.SERIALIZATION_STATE) // model.get_var_itemsize(
+        protocol.SERIALIZATION_STATE
     )
-    state_a = model.get_value(bmi_lstm.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
-    state_b = model.get_value(bmi_lstm.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
+    state_a = model.get_value(protocol.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
+    state_b = model.get_value(protocol.SERIALIZATION_STATE, np.empty(n, dtype="uint8"))
     np.testing.assert_array_equal(state_a, state_b)
-    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is model.get_value_ptr(
-        bmi_lstm.SERIALIZATION_STATE
+    assert model.get_value_ptr(protocol.SERIALIZATION_STATE) is model.get_value_ptr(
+        protocol.SERIALIZATION_STATE
     )
     assert state_a.tobytes() == _state_bytes(model)
 
@@ -449,8 +441,8 @@ def test_free_before_any_create_does_not_raise(module: bmi_lstm.bmi_LSTM):
     _free(module)
     _free(module)
     assert _size(module) == 0
-    assert len(module.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+    assert len(module.get_value_ptr(protocol.SERIALIZATION_STATE)) == 0
+    assert module.get_var_nbytes(protocol.SERIALIZATION_STATE) == 0
 
 
 def test_create_before_initialize_raises_and_free_still_safe():
@@ -459,12 +451,12 @@ def test_create_before_initialize_raises_and_free_still_safe():
         _create(model)
     # a failed create leaves the buffer untouched ...
     assert _size(model) == 0
-    assert len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    assert len(model.get_value_ptr(protocol.SERIALIZATION_STATE)) == 0
     # ... and free afterwards is still safe
     _free(model)
     assert _size(model) == 0
     with pytest.raises(RuntimeError, match="initialize"):
-        model.capture_state()
+        model.snapshot()
 
 
 @pytest.mark.parametrize("steps", [0, 1, 5])
@@ -522,11 +514,11 @@ def test_snapshot_arrays_do_not_alias_member_tensors():
 def test_trigger_value_is_ignored(value: int):
     model = _initialized(SINGLE_MEMBER_CONFIG)
     _step(model, _forcing(1)[0])
-    reference = model.capture_state()
+    reference = codec.pack(model.snapshot())
 
-    model.set_value(bmi_lstm.SERIALIZATION_CREATE, np.array([value], dtype="int32"))
+    model.set_value(protocol.SERIALIZATION_CREATE, np.array([value], dtype="int32"))
     assert _state_bytes(model) == reference
-    model.set_value(bmi_lstm.SERIALIZATION_FREE, np.array([value], dtype="int32"))
+    model.set_value(protocol.SERIALIZATION_FREE, np.array([value], dtype="int32"))
     assert _size(model) == 0
 
 
@@ -538,13 +530,13 @@ def test_free_releases_captured_buffer():
 
     _free(model)
     assert _size(model) == 0
-    state_ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    state_ptr = model.get_value_ptr(protocol.SERIALIZATION_STATE)
     assert state_ptr.dtype == np.dtype("uint8")
     assert state_ptr.shape == (0,)
-    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+    assert model.get_var_nbytes(protocol.SERIALIZATION_STATE) == 0
     # type and units survive a release
-    assert model.get_var_type(bmi_lstm.SERIALIZATION_STATE) == "uint8"
-    assert model.get_var_units(bmi_lstm.SERIALIZATION_STATE) == "ngen::opaque"
+    assert model.get_var_type(protocol.SERIALIZATION_STATE) == "uint8"
+    assert model.get_var_units(protocol.SERIALIZATION_STATE) == "ngen::opaque"
 
 
 def test_finalize_releases_captured_buffer():
@@ -555,7 +547,7 @@ def test_finalize_releases_captured_buffer():
 
     model.finalize()
     assert _size(model) == 0
-    assert len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    assert len(model.get_value_ptr(protocol.SERIALIZATION_STATE)) == 0
 
 
 def test_finalize_safe_without_initialize():
@@ -586,14 +578,14 @@ def test_captured_buffer_is_independent_of_later_updates():
     forcing = _forcing(3, seed=5)
     _step(model, forcing[0])
     _create(model)
-    ptr = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
+    ptr = model.get_value_ptr(protocol.SERIALIZATION_STATE)
     frozen = ptr.tobytes()
 
     for inputs in forcing[1:]:
         _step(model, inputs)
 
     # the buffer is a snapshot, not a view onto the live tensors
-    assert model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is ptr
+    assert model.get_value_ptr(protocol.SERIALIZATION_STATE) is ptr
     assert ptr.tobytes() == frozen
     assert codec.unpack(frozen).timestep == 1
     assert _size(model) == len(frozen)
@@ -614,12 +606,12 @@ def test_size_and_state_stay_within_serialization_state_only():
 
 
 def _announce(model: bmi_lstm.bmi_LSTM, count: int) -> None:
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([count], dtype="int64"))
+    model.set_value(protocol.SERIALIZATION_SIZE, np.array([count], dtype="int64"))
 
 
 def _deliver(model: bmi_lstm.bmi_LSTM, payload: bytes) -> None:
     """Deliver the payload the way ngen's Python adapter does: as a uint8 array."""
-    model.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(payload, dtype="uint8"))
+    model.set_value(protocol.SERIALIZATION_STATE, np.frombuffer(payload, dtype="uint8"))
 
 
 def _restore(model: bmi_lstm.bmi_LSTM, payload: bytes) -> None:
@@ -632,15 +624,20 @@ def _outputs(model: bmi_lstm.bmi_LSTM) -> dict[str, float]:
     return {name: float(model.get_value_ptr(name)[0]) for name in model.get_output_var_names()}
 
 
+def _assert_size_equals_buffer_length(model: bmi_lstm.bmi_LSTM) -> None:
+    """The protocol invariant: the size variable always equals the state buffer's length."""
+    state_ptr = model.get_value_ptr(protocol.SERIALIZATION_STATE)
+    assert _size(model) == len(state_ptr)
+    assert model.get_var_nbytes(protocol.SERIALIZATION_STATE) == len(state_ptr)
+
+
 def _observed(model: bmi_lstm.bmi_LSTM) -> dict:
-    """Everything a restore may or may not touch, copied for later comparison."""
+    """Everything a rejected restore must leave alone, copied for later comparison."""
     return {
         "members": _member_arrays(model),
         "outputs": _outputs(model),
         "timestep": model._timestep,
         "time": model.get_current_time(),
-        "buffer": _state_bytes(model),
-        "buffer_id": id(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)),
     }
 
 
@@ -661,8 +658,7 @@ def _assert_untouched(model: bmi_lstm.bmi_LSTM, before: dict) -> None:
     assert after["outputs"] == before["outputs"]
     assert after["timestep"] == before["timestep"]
     assert after["time"] == before["time"]
-    assert after["buffer"] == before["buffer"]
-    assert after["buffer_id"] == before["buffer_id"]
+    _assert_size_equals_buffer_length(model)
 
 
 def _captured_after(config: Path, steps: int, seed: int = 0) -> tuple[bmi_lstm.bmi_LSTM, bytes]:
@@ -683,14 +679,15 @@ def test_announce_then_deliver_restores_members_and_outputs(config: Path):
 
     _announce(target, len(payload))
     # between the two calls ngen sizes the incoming array from nbytes / itemsize
-    assert target.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == len(payload)
-    assert target.get_var_itemsize(bmi_lstm.SERIALIZATION_STATE) == 1
+    assert target.get_var_nbytes(protocol.SERIALIZATION_STATE) == len(payload)
+    assert target.get_var_itemsize(protocol.SERIALIZATION_STATE) == 1
     assert _size(target) == len(payload)
-    # the capture buffer itself is not pre-filled by the announcement
-    assert len(target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    # the announcement allocates the buffer ngen is about to fill
+    _assert_size_equals_buffer_length(target)
 
     _deliver(target, payload)
 
+    _assert_size_equals_buffer_length(target)
     _assert_members_equal(_member_arrays(target), _member_arrays(source))
     assert _outputs(target) == _outputs(source)
     for restored, original in zip(target.ensemble_members, source.ensemble_members):
@@ -714,27 +711,27 @@ def test_restore_does_not_apply_timestep_or_clock(config: Path):
     assert target.get_current_time() == bmi_lstm.bmi_LSTM._timestep_size_s
 
 
-@pytest.mark.parametrize("count", [0, 1, 12345, 2**40])
+@pytest.mark.parametrize("count", [0, 1, 12345, 2**20])
 def test_nbytes_on_state_reports_announced_size(module: bmi_lstm.bmi_LSTM, count: int):
-    """Holds before and after initialize(): the announcement is pure bookkeeping."""
+    """Holds before and after initialize(): the announcement allocates the buffer."""
     _announce(module, count)
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == count
+    assert module.get_var_nbytes(protocol.SERIALIZATION_STATE) == count
     assert _size(module) == count
-    assert module.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE).dtype == np.int64
-    assert len(module.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)) == 0
+    assert module.get_value_ptr(protocol.SERIALIZATION_SIZE).dtype == np.int64
+    assert len(module.get_value_ptr(protocol.SERIALIZATION_STATE)) == count
     # the other reserved names keep their fixed sizes
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_SIZE) == 8
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_CREATE) == 4
-    assert module.get_var_nbytes(bmi_lstm.SERIALIZATION_FREE) == 4
+    assert module.get_var_nbytes(protocol.SERIALIZATION_SIZE) == 8
+    assert module.get_var_nbytes(protocol.SERIALIZATION_CREATE) == 4
+    assert module.get_var_nbytes(protocol.SERIALIZATION_FREE) == 4
 
 
 def test_announce_accepts_python_int_and_other_integer_arrays():
     model = bmi_lstm.bmi_LSTM()
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, 7)  # type: ignore[arg-type]
+    model.set_value(protocol.SERIALIZATION_SIZE, 7)  # type: ignore[arg-type]
     assert _size(model) == 7
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([9], dtype="int32"))
+    model.set_value(protocol.SERIALIZATION_SIZE, np.array([9], dtype="int32"))
     assert _size(model) == 9
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([[11]], dtype="int64"))
+    model.set_value(protocol.SERIALIZATION_SIZE, np.array([[11]], dtype="int64"))
     assert _size(model) == 11
 
 
@@ -747,7 +744,7 @@ def test_announce_rejects_invalid_counts(bad: np.ndarray):
     model = bmi_lstm.bmi_LSTM()
     _announce(model, 5)
     with pytest.raises(ValueError):
-        model.set_value(bmi_lstm.SERIALIZATION_SIZE, bad)
+        model.set_value(protocol.SERIALIZATION_SIZE, bad)
     assert _size(model) == 5
 
 
@@ -756,11 +753,11 @@ def test_nbytes_after_create_equals_buffer_length_and_free_resets(config: Path):
     model = _initialized(config)
     _announce(model, 99)
     _create(model)
-    n = len(model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE))
+    n = len(model.get_value_ptr(protocol.SERIALIZATION_STATE))
     assert n != 99
-    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == n == _size(model)
+    assert model.get_var_nbytes(protocol.SERIALIZATION_STATE) == n == _size(model)
     _free(model)
-    assert model.get_var_nbytes(bmi_lstm.SERIALIZATION_STATE) == 0
+    assert model.get_var_nbytes(protocol.SERIALIZATION_STATE) == 0
 
 
 def test_restore_into_differently_configured_module_raises_and_leaves_state(
@@ -849,30 +846,44 @@ def test_restore_before_initialize_raises():
     assert _size(model) == 0
 
 
-def test_restore_does_not_touch_capture_buffer(config: Path):
-    _, payload = _captured_after(config, steps=5)
+def test_size_equals_buffer_length_through_capture_announce_and_deliver(config: Path):
+    """The size variable tracks the buffer length at every protocol transition."""
+    source, payload = _captured_after(config, steps=5)
     target = _initialized(config)
     for inputs in _forcing(2, seed=11):
         _step(target, inputs)
+    _assert_size_equals_buffer_length(target)
+
     _create(target)
-    buffer = target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE)
-    captured = buffer.tobytes()
+    captured = _state_bytes(target)
     assert captured != payload
-
-    # delivery without a prior announcement (a standalone caller) leaves both
-    # the buffer and its recorded size alone
-    _deliver(target, payload)
-    assert target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is buffer
-    assert buffer.tobytes() == captured
     assert _size(target) == len(captured)
+    _assert_size_equals_buffer_length(target)
 
-    # with the announcement the size reflects the announcement, but the
-    # buffer is still not touched
-    _restore(target, payload)
-    assert target.get_value_ptr(bmi_lstm.SERIALIZATION_STATE) is buffer
-    assert buffer.tobytes() == captured
+    _announce(target, len(payload))
     assert _size(target) == len(payload)
-    assert codec.unpack(buffer).timestep == 2
+    _assert_size_equals_buffer_length(target)
+
+    _deliver(target, payload)
+    assert _size(target) == len(payload)
+    _assert_size_equals_buffer_length(target)
+    _assert_members_equal(_member_arrays(target), _member_arrays(source))
+    assert _outputs(target) == _outputs(source)
+
+
+def test_delivery_length_mismatch_raises_before_restore_and_leaves_state(config: Path):
+    """A valid payload whose length disagrees with the announcement is rejected untouched."""
+    _, payload = _captured_after(config, steps=3)
+    target = _initialized(config)
+    for inputs in _forcing(2, seed=13):
+        _step(target, inputs)
+    before = _observed(target)
+
+    _announce(target, len(payload) - 1)
+    with pytest.raises(ValueError, match="announced"):
+        _deliver(target, payload)
+    _assert_untouched(target, before)
+    assert _size(target) == len(payload) - 1
 
 
 def test_restore_then_continue_matches_uninterrupted_run(config: Path):
@@ -907,7 +918,7 @@ def test_restore_accepts_bytes_like_deliveries(config: Path, kind: str):
 
     target = _initialized(config)
     _announce(target, len(payload))
-    target.set_value(bmi_lstm.SERIALIZATION_STATE, delivered)  # type: ignore[arg-type]
+    target.set_value(protocol.SERIALIZATION_STATE, delivered)  # type: ignore[arg-type]
     _assert_members_equal(_member_arrays(target), _member_arrays(source))
     assert _outputs(target) == _outputs(source)
 
@@ -918,25 +929,21 @@ def test_restored_state_is_independent_of_delivered_array(config: Path):
 
     target = _initialized(config)
     _announce(target, len(delivered))
-    target.set_value(bmi_lstm.SERIALIZATION_STATE, delivered)
+    target.set_value(protocol.SERIALIZATION_STATE, delivered)
     delivered[codec.HEADER_SIZE:] = 0xFF
 
     _assert_members_equal(_member_arrays(target), _member_arrays(source))
     assert _outputs(target) == _outputs(source)
 
 
-def test_restore_state_method_and_apply_snapshot_direct(config: Path):
-    """Standalone callers may bypass set_value and use the public helpers."""
+def test_apply_snapshot_direct_restores_members_and_outputs(config: Path):
+    """Standalone callers may bypass set_value and apply a decoded snapshot directly."""
     source, payload = _captured_after(config, steps=3)
 
     target = _initialized(config)
-    target.restore_state(payload)
+    target.apply_snapshot(codec.unpack(payload))
     _assert_members_equal(_member_arrays(target), _member_arrays(source))
-
-    other = _initialized(config)
-    other.apply_snapshot(codec.unpack(payload))
-    _assert_members_equal(_member_arrays(other), _member_arrays(source))
-    assert _outputs(other) == _outputs(source)
+    assert _outputs(target) == _outputs(source)
 
 
 def test_matching_fingerprint_with_wrong_output_count_raises(config: Path):
@@ -995,7 +1002,7 @@ def test_reserved_names_stay_out_of_var_lists_after_restore(config: Path):
     _, payload = _captured_after(config, steps=1)
     target = _initialized(config)
     _restore(target, payload)
-    for name in bmi_lstm.SERIALIZATION_VAR_NAMES:
+    for name in protocol.SERIALIZATION_VAR_NAMES:
         assert name not in target.get_input_var_names()
         assert name not in target.get_output_var_names()
 

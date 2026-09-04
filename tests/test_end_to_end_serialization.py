@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from lstm import bmi_lstm
+from lstm import serialization_protocol as protocol
 
 REPO_ROOT = Path(__file__).parent.parent
 BASIN_ID = "02064000"
@@ -93,17 +94,17 @@ def _run(model: bmi_lstm.bmi_LSTM, forcing: list[dict[str, np.ndarray]]) -> dict
 
 def _capture_and_free(model: bmi_lstm.bmi_LSTM) -> tuple[int, bytes]:
     """The ngen save sequence: create, read size and state, free."""
-    model.set_value(bmi_lstm.SERIALIZATION_CREATE, TRIGGER)
-    size = int(model.get_value_ptr(bmi_lstm.SERIALIZATION_SIZE)[0])
-    state = model.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).tobytes()
-    model.set_value(bmi_lstm.SERIALIZATION_FREE, TRIGGER)
+    model.set_value(protocol.SERIALIZATION_CREATE, TRIGGER)
+    size = int(model.get_value_ptr(protocol.SERIALIZATION_SIZE)[0])
+    state = model.get_value_ptr(protocol.SERIALIZATION_STATE).tobytes()
+    model.set_value(protocol.SERIALIZATION_FREE, TRIGGER)
     return size, state
 
 
 def _announce_and_deliver(model: bmi_lstm.bmi_LSTM, size: int, state: bytes) -> None:
     """The ngen restore sequence: announce the byte count, then deliver the bytes."""
-    model.set_value(bmi_lstm.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
-    model.set_value(bmi_lstm.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
+    model.set_value(protocol.SERIALIZATION_SIZE, np.array([size], dtype="int64"))
+    model.set_value(protocol.SERIALIZATION_STATE, np.frombuffer(state, dtype="uint8"))
 
 
 def _member_arrays(model: bmi_lstm.bmi_LSTM) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -148,7 +149,7 @@ def test_single_member_split_and_restore_matches_uninterrupted_run(
     observed = _run(first_half, nldas_forcing[:SPLIT_STEP])
     size, state = _capture_and_free(first_half)
     assert size == len(state) > 0
-    assert first_half.get_value_ptr(bmi_lstm.SERIALIZATION_STATE).size == 0
+    assert first_half.get_value_ptr(protocol.SERIALIZATION_STATE).size == 0
 
     # second half: fresh module, ngen restore sequence, remaining 12 steps
     second_half = _initialized()
