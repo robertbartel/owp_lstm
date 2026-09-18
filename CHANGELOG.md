@@ -6,6 +6,12 @@ We follow the [Semantic Versioning 2.0.0](http://semver.org/) format.
 
 ### Added
 
+- BMI configuration files may provide static attributes either as a nested
+  `static_attributes` mapping or as flat top-level keys. In the flat shape the
+  attribute names are taken from the trained model config(s) listed under
+  `train_cfg_file`, and a missing key fails `initialize()` with a `ValueError`
+  naming every absent attribute. The nested shape is unchanged. This lets the
+  module read generated per-catchment configs, including JSON files, as-is.
 - Support for the ngen BMI Serialization Protocol (v0.2), so NextGen can
   checkpoint and restore the module's computed state. The four reserved
   variables `ngen::serialization_create`, `ngen::serialization_free`,

@@ -450,6 +450,46 @@ def load_static_attributes(cfg_static_attrs: dict[str, typing.Any], state: State
         state.set_value(name, bmi_array([value]))
 
 
+def resolve_static_attributes(
+    cfg_bmi: dict[str, typing.Any], members: typing.Sequence[EnsembleMember]
+) -> dict[str, typing.Any]:
+    """
+    Return the ``{name: value}`` static attributes a BMI config provides.
+
+    Two config shapes are accepted:
+
+    * nested: the config carries a ``static_attributes`` mapping and that
+      mapping is returned as-is, so it may hold attributes for any member.
+    * flat: the config has no ``static_attributes`` key and each attribute is
+      a top-level key. The attribute names are taken from the members' trained
+      model configs (in member order, without duplicates) and read from the
+      top level; a missing key raises ``ValueError`` naming every absent
+      attribute.
+    """
+    if "static_attributes" in cfg_bmi:
+        nested = cfg_bmi["static_attributes"]
+        if not isinstance(nested, dict):
+            raise ValueError(
+                "'static_attributes' must be a mapping of attribute name to value, "
+                f"got {type(nested).__name__}"
+            )
+        return dict(nested)
+
+    names: dict[str, None] = {}
+    for member in members:
+        names.update((name, None) for name in member.cfg["static_attributes"])
+
+    missing = [name for name in names if name not in cfg_bmi]
+    if missing:
+        raise ValueError(
+            f"Missing static attributes: {sorted(missing)}.\n"
+            "The config has no 'static_attributes' mapping, so each attribute "
+            "named by the trained model config(s) must be a top-level key.\n"
+            f"Expected by the lstm: {list(names)}\n"
+        )
+    return {name: cfg_bmi[name] for name in names}
+
+
 class bmi_LSTM(BmiBase):
     _timestep_size_s: typing.Final[int] = 3600
     """model timestep size in seconds"""
@@ -485,14 +525,6 @@ class bmi_LSTM(BmiBase):
         # read and setup main configuration file
         with open(config_file, "r") as fp:
             self.cfg_bmi = yaml.load(fp, Loader=SafeLoader)
-
-        _static_input_vars = [
-            (key, '1') 
-            for key in self.cfg_bmi["static_attributes"].keys()
-        ]
-        
-        self._static_inputs = build_state(_static_input_vars)
-        
         coerce_config(self.cfg_bmi)
 
         # TODO: aaraney: config logging levels to python logging levels
@@ -514,7 +546,15 @@ class bmi_LSTM(BmiBase):
             member = EnsembleMember(cfg, output_factor_cms)
             self.ensemble_members.append(member)
 
-            provided_inputs = {v[0] for v in _static_input_vars} | {v for v in member.input_names if v in DYNAMIC_INPUT_NAME_CROSSWALK}
+        # static attributes come from a nested `static_attributes` mapping or,
+        # for flat configs, from top-level keys named by the trained models.
+        static_attributes = resolve_static_attributes(self.cfg_bmi, self.ensemble_members)
+        self._static_inputs = build_state((name, "1") for name in static_attributes)
+
+        for member in self.ensemble_members:
+            provided_inputs = set(static_attributes) | {
+                v for v in member.input_names if v in DYNAMIC_INPUT_NAME_CROSSWALK
+            }
             required_inputs = set(member.input_names)
 
             if not required_inputs.issubset(provided_inputs):
@@ -526,7 +566,7 @@ class bmi_LSTM(BmiBase):
                 )
 
         # load static variables from config into state
-        load_static_attributes(self.cfg_bmi["static_attributes"], self._static_inputs)
+        load_static_attributes(static_attributes, self._static_inputs)
 
         # identity of the fully constructed ensemble, used to reject state
         # payloads produced by a differently configured module.

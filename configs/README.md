@@ -9,6 +9,25 @@ These key value pairs are used by the BMI to set up the model in some particular
 
 ## Static Attributes
 These are static attributes that are particular to the catchment. These should be calculated in the same manner as the values which the LSTM was trained. Some description is provided below, but again see [Addor et al. 2017](https://doi.org/10.5194/hess-21-5293-2017) for more details. 
+
+The attributes a run needs are the names listed under `static_attributes` in each trained model's `config.yml`. The BMI configuration file may provide them in either of two shapes; both build the same model:
+
+- **Nested**: a `static_attributes` mapping holds every attribute. Use this when an ensemble's members were trained on different attribute sets, since the mapping may carry the union. See [`config_file_ensemble.yaml`](./config_file_ensemble.yaml).
+  ```yaml
+  train_cfg_file: ./trained_neuralhydrology_models/<model>/config.yml
+  area_sqkm: 427.77
+  static_attributes:
+    elev_mean: 192.21
+    slope_mean: 9.95686
+  ```
+- **Flat**: no `static_attributes` key; each attribute named by the trained model config(s) is a top-level key. This is the shape of generated per-catchment configs, which may also be written as JSON since JSON is valid YAML.
+  ```json
+  {"train_cfg_file": "./trained_neuralhydrology_models/<model>/config.yml",
+   "area_sqkm": 427.77, "elev_mean": 192.21, "slope_mean": 9.95686, "verbose": false}
+  ```
+  A flat config missing an attribute the trained model needs fails at `initialize()` with a `ValueError` naming the absent keys.
+
+`area_sqkm` is always a top-level key, since the BMI also uses it to convert the area-normalized runoff to a volume flux.
 - `area_sqkm: 620.38` allows bmi to adjust a weighted output
 - `elev_mean: 92.68` catchment mean elevation (m) above sea level
 - `slope_mean: 17.79072` catchment mean slope (m km−1)
