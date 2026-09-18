@@ -49,27 +49,16 @@ def static_values(model: bmi_LSTM) -> dict[str, float]:
     return {name: float(state.value(name)[0]) for name in state.names()}
 
 
-@pytest.fixture
-def flat_yaml(tmp_path: Path, bundled_model_config: str) -> Path:
-    return write_flat_yaml(tmp_path / "flat.yml", bundled_model_config, STATIC)
-
-
-@pytest.fixture
-def flat_json(tmp_path: Path, bundled_model_config: str) -> Path:
-    return write_flat_json(tmp_path / "flat.json", bundled_model_config, STATIC)
-
-
-@pytest.mark.parametrize("flat", ["flat_yaml", "flat_json"])
+@pytest.mark.parametrize("write_flat", [write_flat_yaml, write_flat_json], ids=["yaml", "json"])
 def test_flat_config_matches_nested_golden(
-    flat: str, request: pytest.FixtureRequest, nldas_forcing: Forcing
+    write_flat, tmp_path: Path, bundled_model_config: str, nldas_forcing: Forcing
 ) -> None:
-    flat_path: Path = request.getfixturevalue(flat)
+    flat_path = write_flat(tmp_path / "flat", bundled_model_config, STATIC)
     nested = initialized(GOLDEN_CONFIG)
     flat_model = initialized(flat_path)
 
     assert flat_model.get_input_var_names() == nested.get_input_var_names()
     assert static_values(flat_model) == static_values(nested)
-
     assert run(flat_model, nldas_forcing) == run(nested, nldas_forcing)
 
 

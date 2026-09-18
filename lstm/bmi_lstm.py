@@ -50,6 +50,7 @@
 from __future__ import annotations
 
 import collections
+import functools
 import typing
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,45 +117,100 @@ def crosswalk_to_external(name: str):
     """Return the external name (the name exposed via BMI) for a given internal name."""
     return DYNAMIC_INPUT_NAME_CROSSWALK.get(name, name)
 
+# ---------------  Trained Model -----------------------------
+
+
+def bmi_array(arr: list[float]) -> npt.NDArray:
+    """Trivial wrapper function to ensure the expected numpy array datatype is used."""
+    return np.array(arr, dtype="float64")
+
+
+class Valuer(typing.Protocol):
+    """Thin interface with the same signature as `State.value`."""
+
+    def value(self, name: str) -> npt.NDArray: ...
+
+
+@dataclass
+class TrainingScalars:
+    input_mean: npt.NDArray
+    input_std: npt.NDArray
+    output_mean: npt.NDArray
+    output_std: npt.NDArray
+
+
+@dataclass(frozen=True)
+class TrainedModel:
+    """
+    A trained neuralhydrology model as loaded for inference: its training
+    config, feature scalars, frozen weights, and the order of its inputs.
+
+    Instances are shared. `load_trained_model` returns the same object for
+    every call naming the same config file, so a process running many
+    catchments holds one copy of each model's weights. Sharing is safe because
+    the module holds parameters only (each `EnsembleMember` owns its hidden
+    and cell state), inference runs under `torch.no_grad()`, and the
+    parameters are frozen after loading. Treat `cfg` as read-only.
+    """
+
+    cfg: dict[str, typing.Any]
+    scalars: TrainingScalars
+    lstm: nextgen_cuda_lstm.Nextgen_CudaLSTM
+    input_names: tuple[str, ...]
+    """order of the model input tensor: dynamic inputs then static attributes"""
+    hidden_size: int
+    """element count of each of the hidden and cell state tensors"""
+
+
+@functools.lru_cache(maxsize=None)
+def load_trained_model(config_file: Path) -> TrainedModel:
+    """
+    Load a `TrainedModel` from its training config, once per distinct path.
+
+    Every dynamic input the model was trained on must have a BMI name in
+    `DYNAMIC_INPUT_NAME_CROSSWALK`; otherwise `ValueError` is raised.
+    """
+    cfg = yaml.load(config_file.read_text(), Loader=SafeLoader)
+    coerce_config(cfg)
+
+    unmapped = [n for n in cfg["dynamic_inputs"] if n not in DYNAMIC_INPUT_NAME_CROSSWALK]
+    if unmapped:
+        raise ValueError(
+            f"Dynamic inputs {unmapped} in {config_file} have no BMI name.\n"
+            f"Known dynamic inputs: {sorted(DYNAMIC_INPUT_NAME_CROSSWALK)}\n"
+        )
+
+    scaler_file = cfg["run_dir"] / "train_data/train_data_scaler.yml"
+    with scaler_file.open("r") as fp:
+        train_data_scaler = yaml.load(fp, Loader=SafeLoader)
+
+    return TrainedModel(
+        cfg=cfg,
+        scalars=load_training_scalars(cfg, train_data_scaler),
+        lstm=initialize_lstm(cfg),
+        input_names=tuple(cfg["dynamic_inputs"]) + tuple(cfg["static_attributes"]),
+        hidden_size=int(cfg["hidden_size"]),
+    )
+
+
 # ---------------  Ensemble Member -----------------------------
 
 
 class EnsembleMember:
     """
-    An `EnsembleMember` is responsible for initializing and maintaining an LSTM model,
-    handling input scaling, managing hidden and cell states, and performing
-    inference using the trained model.
+    One catchment's instance of a `TrainedModel`: the hidden and cell state
+    that evolve with each timestep, and the output scaling for the catchment
+    area. The model itself is shared with every member built from the same
+    training config.
     """
 
-    def __init__(self, cfg: dict[str, typing.Any], output_scaling_factor_cms: float):
-        self.cfg = cfg
-        # NOTE: aaraney: not sure if this *should* go here. leaving it for now.
+    def __init__(self, model: TrainedModel, output_scaling_factor_cms: float):
+        self.model = model
         self.output_scaling_factor_cms = output_scaling_factor_cms
-
-        # load training feature scales
-        scaler_file = cfg["run_dir"] / "train_data/train_data_scaler.yml"
-        with scaler_file.open("r") as fp:
-            train_data_scaler = yaml.load(fp, Loader=SafeLoader)
-        self.scalars = load_training_scalars(cfg, train_data_scaler)
-
-        # initialize torch lstm object
-        self.lstm = initialize_lstm(cfg)
-
-        # TODO: aaraney: how to handle input mapping conceptually?
-        # NOTE: this is the expected order of variables in the model input
-        # tensor, which is required to match the training order when used
-        self.input_names = cfg["dynamic_inputs"] + cfg["static_attributes"]
-
         # WARNING: This implementation of the LSTM can only handle a batch size of 1
-        # No need to included different batch sizes
-        batch_size = 1
-        hidden_layer_size = cfg["hidden_size"]
-        self.hidden_size: int = int(hidden_layer_size)
-        """element count of each of the hidden and cell state tensors"""
-        # if init_config['initial_state'] == 'zero':
         # NOTE: aaraney: assume initial state is always zero (ask jframe about this. no other option now)
-        self.h_t = torch.zeros(1, batch_size, hidden_layer_size).float()
-        self.c_t = torch.zeros(1, batch_size, hidden_layer_size).float()
+        self.h_t = torch.zeros(1, 1, model.hidden_size).float()
+        self.c_t = torch.zeros(1, 1, model.hidden_size).float()
 
     def update(self, state: Valuer) -> typing.Iterable[Var]:
         """
@@ -163,13 +219,14 @@ class EnsembleMember:
         `state` contains the input variable names, units, and values for the
         current iteration.
         """
+        model = self.model
         with torch.no_grad():
-            inputs = gather_inputs(state, self.input_names)
+            inputs = gather_inputs(state, model.input_names)
             scaled = scale_inputs(
-                inputs, self.scalars.input_mean, self.scalars.input_std
+                inputs, model.scalars.input_mean, model.scalars.input_std
             )
             input_tensor = torch.tensor(scaled)
-            lstm_output, self.h_t, self.c_t = self.lstm.forward(
+            lstm_output, self.h_t, self.c_t = model.lstm.forward(
                 input_tensor, self.h_t, self.c_t
             )
             # TODO: aaraney, there is gap here between mapping 'internal'
@@ -177,10 +234,10 @@ class EnsembleMember:
             # hard-coded and handled in `scale_outputs`. Introduce semantics
             # for more generally handling outputs.
             yield from scale_outputs(
-                self.cfg,
+                model.cfg,
                 lstm_output,
-                self.scalars.output_mean,
-                self.scalars.output_std,
+                model.scalars.output_mean,
+                model.scalars.output_std,
                 self.output_scaling_factor_cms,
             )
 
@@ -211,33 +268,14 @@ class EnsembleMember:
         hidden_arr = np.asarray(hidden, dtype="float32").ravel()
         cell_arr = np.asarray(cell, dtype="float32").ravel()
         for label, arr in (("hidden", hidden_arr), ("cell", cell_arr)):
-            if arr.size != self.hidden_size:
+            if arr.size != self.model.hidden_size:
                 raise ValueError(
                     f"{label} state has {arr.size} elements but this member "
-                    f"has hidden size {self.hidden_size}"
+                    f"has hidden size {self.model.hidden_size}"
                 )
         shape = tuple(self.h_t.shape)
         self.h_t = torch.tensor(hidden_arr, dtype=torch.float32).reshape(shape)
         self.c_t = torch.tensor(cell_arr, dtype=torch.float32).reshape(shape)
-
-
-def bmi_array(arr: list[float]) -> npt.NDArray:
-    """Trivial wrapper function to ensure the expected numpy array datatype is used."""
-    return np.array(arr, dtype="float64")
-
-
-class Valuer(typing.Protocol):
-    """Thin interface with the same signature as `State.value`."""
-
-    def value(self, name: str) -> npt.NDArray: ...
-
-
-@dataclass
-class TrainingScalars:
-    input_mean: npt.NDArray
-    input_std: npt.NDArray
-    output_mean: npt.NDArray
-    output_std: npt.NDArray
 
 
 def load_training_scalars(
@@ -274,9 +312,8 @@ def load_training_scalars(
 
 
 def initialize_lstm(cfg: dict[str, typing.Any]) -> nextgen_cuda_lstm.Nextgen_CudaLSTM:
-    # Collect the LSTM model architecture details from the configuration file
+    """Build the inference-only LSTM for a training config and load its trained weights."""
     input_size = len(cfg["dynamic_inputs"]) + len(cfg["static_attributes"])
-    # TODO: aaraney: verify there is a mapping from internal names to external names
     hidden_layer_size = cfg["hidden_size"]
     output_size = len(cfg["target_variables"])
     lstm = nextgen_cuda_lstm.Nextgen_CudaLSTM(
@@ -304,6 +341,8 @@ def initialize_lstm(cfg: dict[str, typing.Any]) -> nextgen_cuda_lstm.Nextgen_Cud
 
     # Load in the trained weights.
     lstm.load_state_dict(trained_state_dict)
+    lstm.eval()
+    lstm.requires_grad_(False)
     return lstm
 
 
@@ -405,11 +444,11 @@ def member_fingerprint(index: int, member: EnsembleMember) -> str:
     of the loaded weights. It is meant to be readable in a hex dump and is
     compared as bytes, never parsed.
     """
-    cfg = member.cfg
+    cfg = member.model.cfg
     run_dir = Path(cfg["run_dir"]).name
     return (
-        f"{index}:hidden={int(cfg['hidden_size'])},"
-        f"inputs={'|'.join(member.input_names)},"
+        f"{index}:hidden={member.model.hidden_size},"
+        f"inputs={'|'.join(member.model.input_names)},"
         f"run={run_dir},"
         f"epoch={int(cfg['epochs'])}"
     )
@@ -444,50 +483,35 @@ def build_state(vars: typing.Iterable[tuple[str, str]]) -> State:
     return State(vars=g)
 
 
-def load_static_attributes(cfg_static_attrs: dict[str, typing.Any], state: State):
-    for name in state.names():
-        value = cfg_static_attrs[name]
-        state.set_value(name, bmi_array([value]))
-
-
 def resolve_static_attributes(
-    cfg_bmi: dict[str, typing.Any], members: typing.Sequence[EnsembleMember]
+    cfg_bmi: dict[str, typing.Any], models: typing.Iterable[TrainedModel]
 ) -> dict[str, typing.Any]:
     """
-    Return the ``{name: value}`` static attributes a BMI config provides.
+    Return ``{name: value}`` for every static attribute the models require.
 
-    Two config shapes are accepted:
-
-    * nested: the config carries a ``static_attributes`` mapping and that
-      mapping is returned as-is, so it may hold attributes for any member.
-    * flat: the config has no ``static_attributes`` key and each attribute is
-      a top-level key. The attribute names are taken from the members' trained
-      model configs (in member order, without duplicates) and read from the
-      top level; a missing key raises ``ValueError`` naming every absent
-      attribute.
+    The names come from the trained model configs, in model order without
+    duplicates. The values come from the config's ``static_attributes``
+    mapping when it has one and from the top-level keys otherwise, so the
+    nested and the flat (generated, often JSON) config shapes are read the
+    same way. A missing value raises ``ValueError`` naming every absent
+    attribute.
     """
-    if "static_attributes" in cfg_bmi:
-        nested = cfg_bmi["static_attributes"]
-        if not isinstance(nested, dict):
-            raise ValueError(
-                "'static_attributes' must be a mapping of attribute name to value, "
-                f"got {type(nested).__name__}"
-            )
-        return dict(nested)
+    source = cfg_bmi.get("static_attributes", cfg_bmi)
+    if not isinstance(source, dict):
+        raise ValueError(
+            "'static_attributes' must be a mapping of attribute name to value, "
+            f"got {type(source).__name__}"
+        )
 
-    names: dict[str, None] = {}
-    for member in members:
-        names.update((name, None) for name in member.cfg["static_attributes"])
-
-    missing = [name for name in names if name not in cfg_bmi]
+    names = list(dict.fromkeys(n for m in models for n in m.cfg["static_attributes"]))
+    missing = [n for n in names if n not in source]
     if missing:
         raise ValueError(
             f"Missing static attributes: {sorted(missing)}.\n"
-            "The config has no 'static_attributes' mapping, so each attribute "
-            "named by the trained model config(s) must be a top-level key.\n"
-            f"Expected by the lstm: {list(names)}\n"
+            f"Expected by the lstm: {names}\n"
+            "Provide them under a 'static_attributes' mapping or as top-level keys.\n"
         )
-    return {name: cfg_bmi[name] for name in names}
+    return {n: source[n] for n in names}
 
 
 class bmi_LSTM(BmiBase):
@@ -538,35 +562,21 @@ class bmi_LSTM(BmiBase):
             (1 / 1000) * (self.cfg_bmi["area_sqkm"] * 1000 * 1000) * (1 / 3600)
         )
 
-        # initialize ensemble members
-        self.ensemble_members = []
-        for member_cfg_file in self.cfg_bmi["train_cfg_file"]:
-            cfg = yaml.load(member_cfg_file.read_text(), Loader=SafeLoader)
-            coerce_config(cfg)
-            member = EnsembleMember(cfg, output_factor_cms)
-            self.ensemble_members.append(member)
+        # `resolve()` so every spelling of one config path shares a single loaded model.
+        self.ensemble_members = [
+            EnsembleMember(load_trained_model(cfg_file.resolve()), output_factor_cms)
+            for cfg_file in self.cfg_bmi["train_cfg_file"]
+        ]
 
-        # static attributes come from a nested `static_attributes` mapping or,
-        # for flat configs, from top-level keys named by the trained models.
-        static_attributes = resolve_static_attributes(self.cfg_bmi, self.ensemble_members)
-        self._static_inputs = build_state((name, "1") for name in static_attributes)
-
-        for member in self.ensemble_members:
-            provided_inputs = set(static_attributes) | {
-                v for v in member.input_names if v in DYNAMIC_INPUT_NAME_CROSSWALK
-            }
-            required_inputs = set(member.input_names)
-
-            if not required_inputs.issubset(provided_inputs):
-                missing = required_inputs - provided_inputs
-                raise ValueError(
-                    f"Missing required inputs: {missing}.\n"
-                    f"Provided in the config: {provided_inputs}\n"
-                    f"Expected by the lstm: {sorted(required_inputs)}\n"
-                )
-
-        # load static variables from config into state
-        load_static_attributes(static_attributes, self._static_inputs)
+        static_attributes = resolve_static_attributes(
+            self.cfg_bmi, (m.model for m in self.ensemble_members)
+        )
+        self._static_inputs = State(
+            vars=(
+                Var(name=name, unit="1", value=bmi_array([value]))
+                for name, value in static_attributes.items()
+            )
+        )
 
         # identity of the fully constructed ensemble, used to reject state
         # payloads produced by a differently configured module.
@@ -798,11 +808,11 @@ class bmi_LSTM(BmiBase):
                 f"module has {len(members)}"
             )
         for index, (member, (hidden, cell)) in enumerate(zip(members, snapshot.members)):
-            if hidden.size != member.hidden_size or cell.size != member.hidden_size:
+            if hidden.size != member.model.hidden_size or cell.size != member.model.hidden_size:
                 raise serialization_codec.PayloadError(
                     f"payload member {index} carries hidden size {hidden.size} "
                     f"(cell {cell.size}) but this module's member has "
-                    f"{member.hidden_size}"
+                    f"{member.model.hidden_size}"
                 )
         output_names = list(self._outputs.names())
         if len(snapshot.outputs) != len(output_names):

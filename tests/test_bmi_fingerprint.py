@@ -20,7 +20,8 @@ from helpers import initialized
 def _fake_member(hidden_size: int, inputs: list[str], run_dir: str, epochs: int):
     """Stand-in with the attributes `member_fingerprint` reads; no torch model."""
     cfg = {"hidden_size": hidden_size, "run_dir": Path(run_dir), "epochs": epochs}
-    return types.SimpleNamespace(cfg=cfg, input_names=list(inputs))
+    model = types.SimpleNamespace(cfg=cfg, hidden_size=hidden_size, input_names=tuple(inputs))
+    return types.SimpleNamespace(model=model)
 
 
 def test_compute_fingerprint_is_readable_text():

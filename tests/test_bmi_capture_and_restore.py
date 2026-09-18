@@ -159,7 +159,7 @@ def test_captured_bytes_unpack_to_current_state(config: Path, steps: int):
     assert len(snapshot.members) == len(model.ensemble_members)
     for (hidden, cell), (h_t, c_t) in zip(snapshot.members, member_arrays(model)):
         assert hidden.dtype == np.dtype("float32")
-        assert hidden.shape == h_t.shape == (model.ensemble_members[0].cfg["hidden_size"],)
+        assert hidden.shape == h_t.shape == (model.ensemble_members[0].model.hidden_size,)
         np.testing.assert_array_equal(hidden, h_t)
         np.testing.assert_array_equal(cell, c_t)
         if steps == 0:
@@ -527,8 +527,8 @@ def test_member_state_arrays_are_flat_float32_copies(golden_config: Path):
     member = model.ensemble_members[0]
     hidden, cell = member.state_arrays()
     assert hidden.dtype == cell.dtype == np.float32
-    assert hidden.shape == cell.shape == (member.hidden_size,)
-    assert member.hidden_size == 126
+    assert hidden.shape == cell.shape == (member.model.hidden_size,)
+    assert member.model.hidden_size == 126
     # copies: writing to the returned arrays does not touch the member
     hidden[0] = 123.0
     cell[0] = 456.0
@@ -541,8 +541,8 @@ def test_member_set_state_arrays_keeps_tensor_shape_and_dtype(golden_config: Pat
     model = initialized(golden_config)
     member = model.ensemble_members[0]
     shape_before = tuple(member.h_t.shape)
-    hidden = np.arange(member.hidden_size, dtype="float64")
-    cell = -np.arange(member.hidden_size, dtype="float64")
+    hidden = np.arange(member.model.hidden_size, dtype="float64")
+    cell = -np.arange(member.model.hidden_size, dtype="float64")
 
     member.set_state_arrays(hidden, cell)
 
@@ -558,11 +558,11 @@ def test_member_set_state_arrays_rejects_wrong_size_without_mutation(bad: str, g
     model = initialized(golden_config)
     member = model.ensemble_members[0]
     before = member.state_arrays()
-    good = np.ones(member.hidden_size, dtype="float32")
-    wrong = np.ones(member.hidden_size + 1, dtype="float32")
+    good = np.ones(member.model.hidden_size, dtype="float32")
+    wrong = np.ones(member.model.hidden_size + 1, dtype="float32")
     hidden, cell = (wrong, good) if bad == "hidden" else (good, wrong)
 
-    with pytest.raises(ValueError, match=f"{bad} state has {member.hidden_size + 1} elements"):
+    with pytest.raises(ValueError, match=f"{bad} state has {member.model.hidden_size + 1} elements"):
         member.set_state_arrays(hidden, cell)
 
     assert_member_arrays_equal([member.state_arrays()], [before])

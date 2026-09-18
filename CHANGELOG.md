@@ -4,6 +4,18 @@ We follow the [Semantic Versioning 2.0.0](http://semver.org/) format.
 
 ## Unreleased
 
+### Changed
+
+- Trained models are loaded once per process and shared by every
+  `EnsembleMember` that names the same training config, via the new
+  `TrainedModel` type and `load_trained_model`. A member now holds only its
+  hidden and cell state and area scaling, so a process running many
+  catchments keeps one copy of each model's weights instead of one per
+  catchment (about 1.1 MB each for a 256-unit, 18-input model). Outputs are
+  unchanged.
+- A training config whose `dynamic_inputs` include a name with no BMI
+  crosswalk entry is rejected with `ValueError` when it is loaded.
+
 ### Added
 
 - BMI configuration files may provide static attributes either as a nested
