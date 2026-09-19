@@ -80,6 +80,7 @@ from .serialization_protocol import (  # noqa: F401
 from .base import BmiBase
 from .logger import configure_logging, logger
 from .model_state import State, StateFacade, Var
+from .torch_threads import CONFIG_KEY as TORCH_THREADS_KEY, configure_torch_threads
 
 # --------------   Dynamic Attributes -----------------------------
 _dynamic_input_vars = [
@@ -555,6 +556,9 @@ class bmi_LSTM(BmiBase):
         # setup logging
         # self.cfg_bmi["verbose"]
         configure_logging()
+
+        # Before any inference: ranks pinned to one core must not run a node-sized thread pool.
+        configure_torch_threads(self.cfg_bmi.get(TORCH_THREADS_KEY))
 
         # ----------- The output is area normalized, this is needed to un-normalize it
         #                         mm->m                             km2 -> m2          hour->s

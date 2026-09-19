@@ -15,6 +15,12 @@ We follow the [Semantic Versioning 2.0.0](http://semver.org/) format.
   unchanged.
 - A training config whose `dynamic_inputs` include a name with no BMI
   crosswalk entry is rejected with `ValueError` when it is loaded.
+- `initialize()` sets torch's intra-op thread count once per process, to the
+  optional `torch_num_threads` config value, else `OMP_NUM_THREADS`, else 1,
+  and logs the count. NextGen ranks no longer each start a node-sized thread
+  pool, which oversubscribed cores and made long runs time out. This replaces
+  site-wide workarounds such as a `.pth` file calling
+  `torch.set_num_threads(1)`.
 
 ### Added
 

@@ -6,6 +6,7 @@ These key value pairs are used by the BMI to set up the model in some particular
 - `train_cfg_file: ./trained_neuralhydrology_models/hourly_all_attributes_and_forcings/config.yml` found [here](https://github.com/NOAA-OWP/lstm/blob/63116cc6a6bbdb5537868f20ff55cc326795b570/trained_neuralhydrology_models/hourly_all_attributes_and_forcings/config.yml). This is a very important part of the LSTM model. This is a configuration file used when training the model. It has critical information on the LSTM architecture and should not be altered.
 - `initial_state: 'zero'` This is an option to set the initial states of the model to zero.
 - `verbose: 0` Change to `1` in order to print additional BMI information during runtime.
+- `torch_num_threads: 1` Optional. Number of threads torch uses for inference in this process. When absent, `OMP_NUM_THREADS` is used if set, otherwise `1`; the number of CPUs is never used as a default. Single-step LSTM inference gains little from more threads, and under NextGen, where every core runs a rank, extra threads only contend with other ranks. It is applied once per process, by the first instance to initialize; a different value in a later instance's config is ignored with a warning.
 
 ## Static Attributes
 These are static attributes that are particular to the catchment. These should be calculated in the same manner as the values which the LSTM was trained. Some description is provided below, but again see [Addor et al. 2017](https://doi.org/10.5194/hess-21-5293-2017) for more details. 
